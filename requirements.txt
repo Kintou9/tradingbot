@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+pandas
+numpy
+pandas-ta
+vectorbt
+sqlalchemy
+psycopg2-binary
+python-dotenv
+anthropic
+twilio
+alpaca-py
+robin-stocks
+requests
