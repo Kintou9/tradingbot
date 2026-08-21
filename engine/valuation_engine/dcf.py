@@ -58,5 +58,4 @@ def run_dcf(ticker: str, company_name: str, filing_context: str, n_years: int = 
     ) + f"\n\nFiling context:\n{filing_context}"
 
     raw_text, structured = call_and_extract_json(client, "claude-sonnet-5", prompt, max_tokens=4000)
-    # TODO: store raw_text + structured via ResearchNote
     return {"raw_output": raw_text, "structured": structured}

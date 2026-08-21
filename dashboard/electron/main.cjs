@@ -1,11 +1,18 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage } = require("electron");
+const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain } = require("electron");
 const path = require("path");
 const http = require("http");
 const { spawn } = require("child_process");
 
 const PROJECT_ROOT = path.join(__dirname, "..", "..");
+require("dotenv").config({ path: path.join(PROJECT_ROOT, ".env") });
+
 const BACKEND_HEALTH_URL = "http://127.0.0.1:8000/health";
 const DEV_SERVER_URL = process.env.ELECTRON_START_URL;
+
+// Handed to the renderer over IPC (see preload.cjs) rather than baked
+// into the Vite build — a built JS bundle is easy to read straight off
+// disk, an IPC round-trip at least keeps the token out of that artifact.
+ipcMain.handle("get-api-token", () => process.env.DASHBOARD_API_TOKEN ?? null);
 
 let mainWindow = null;
 let tray = null;

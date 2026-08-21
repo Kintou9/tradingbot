@@ -36,3 +36,14 @@ def find_support_resistance(df: pd.DataFrame, window: int = 10) -> dict:
         "support": float(recent["low"].min()),
         "resistance": float(recent["high"].max()),
     }
+
+
+def rolling_support_resistance(df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
+    """Same idea as find_support_resistance, but as a rolling series
+    instead of a single latest-point read — each row's support/resistance
+    uses only that row's own trailing window, so it's safe to use in a
+    day-by-day backtest without look-ahead bias."""
+    return pd.DataFrame({
+        "support": df["low"].rolling(window, min_periods=1).min(),
+        "resistance": df["high"].rolling(window, min_periods=1).max(),
+    })

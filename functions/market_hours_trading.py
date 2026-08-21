@@ -17,6 +17,7 @@ from broker.alpaca_client import client as alpaca_client, get_account, get_posit
 from db.session import SessionLocal
 from db.models import ResearchNote, NewsItem, Position, Trade
 from db.kill_switch import is_bot_enabled, set_bot_enabled
+from notifications.sms import notify_trade, notify_kill_switch_engaged, notify_error
 
 load_dotenv()
 
@@ -83,9 +84,18 @@ def run_market_hours_trading():
         print("Outside market hours, skipping.")
         return
 
+    try:
+        _run_trading_cycle()
+    except Exception as exc:
+        notify_error("market_hours_trading", exc)
+        raise
+
+
+def _run_trading_cycle():
     account = get_account()
     if _daily_loss_limit_breached(account):
         set_bot_enabled(False, reason="daily_loss_limit_hit")
+        notify_kill_switch_engaged("daily_loss_limit_hit")
         print("Daily loss limit breached — kill switch engaged, skipping trading cycle.")
         return
 
@@ -125,6 +135,7 @@ def run_market_hours_trading():
                     ))
                     db.delete(position_row)
                     db.commit()
+                    notify_trade(ticker, "sell", float(held.qty), float(held.current_price), exit_signal.reason)
                     print(f"{ticker}: SELL submitted ({exit_signal.reason})")
                 continue
 
@@ -160,6 +171,7 @@ def run_market_hours_trading():
                     take_profit_price=technical_result.get("target_1"),
                 ))
                 db.commit()
+                notify_trade(ticker, "buy", qty, entry_price, entry_signal.reason)
                 print(f"{ticker}: BUY submitted ({entry_signal.reason}, qty={qty})")
 
         print("Market-hours trading cycle complete.")

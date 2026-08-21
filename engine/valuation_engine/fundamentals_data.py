@@ -129,50 +129,126 @@ def get_recent_13f_filers(ticker: str, company_name: str, limit: int = 10) -> li
     return filers
 
 
-def get_financial_summary(ticker: str, years: int = 3) -> str:
+def get_annual_filings(ticker: str) -> list[dict]:
     """
-    Real revenue/net income/operating cash flow for the last N fiscal
-    years, pulled from SEC EDGAR's structured XBRL company facts — used as
-    the DCF module's filing_context so it projects from real filed
-    numbers rather than text scraped out of a 10-K.
+    Real per-fiscal-year revenue/net income/operating cash flow from SEC
+    EDGAR's structured XBRL company facts, each tagged with the actual
+    date the 10-K was *filed* — not just its fiscal period end.
+
+    That distinction matters for backtesting: a FY2024 10-K isn't public
+    knowledge on 2024-12-31, it's public whenever SEC EDGAR says it was
+    filed (typically 60-90 days later). Point-in-time correctness means
+    gating on `filed`, never on `fiscal_year_end`.
     """
     cik = get_cik(ticker)
     if cik is None:
-        return "No SEC filing data found for this ticker."
+        return []
 
     resp = requests.get(
         f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json",
         headers=SEC_HEADERS,
     )
     if resp.status_code != 200:
-        return "No SEC filing data found for this ticker."
+        return []
 
     facts = resp.json().get("facts", {}).get("us-gaap", {})
 
-    def annual_series(tag_candidates: list[str]) -> dict:
+    def is_genuinely_annual(e: dict) -> bool:
+        """form=="10-K" and fp=="FY" alone isn't reliable — some filers'
+        raw XBRL mistags quarterly/comparative datapoints with fp="FY"
+        (observed on AVGO: 18 "annual" entries, most of them duration-1
+        quarters). Require the (start, end) span to actually be ~a year."""
+        try:
+            start = date.fromisoformat(e["start"])
+            end = date.fromisoformat(e["end"])
+        except (KeyError, ValueError):
+            return False
+        return 340 <= (end - start).days <= 380
+
+    def annual_entries(tag_candidates: list[str]) -> list[dict]:
         for tag in tag_candidates:
             entries = facts.get(tag, {}).get("units", {}).get("USD", [])
-            annual = {e["end"]: e["val"] for e in entries if e.get("form") == "10-K" and e.get("fp") == "FY"}
+            annual = [
+                e for e in entries
+                if e.get("form") == "10-K" and e.get("fp") == "FY" and is_genuinely_annual(e)
+            ]
             if annual:
                 return annual
-        return {}
+        return []
 
-    revenue = annual_series(["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues"])
-    net_income = annual_series(["NetIncomeLoss"])
-    op_cash_flow = annual_series(["NetCashProvidedByUsedInOperatingActivities"])
+    revenue_entries = annual_entries([
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",
+        "Revenues",
+        "SalesRevenueNet",
+    ])
+    net_income_by_end = {e["end"]: e["val"] for e in annual_entries(["NetIncomeLoss"])}
+    op_cash_flow_by_end = {e["end"]: e["val"] for e in annual_entries(["NetCashProvidedByUsedInOperatingActivities"])}
 
-    years_available = sorted(revenue.keys())[-years:]
-    if not years_available:
-        return "No structured revenue data found in SEC filings for this ticker."
+    filings = []
+    seen_ends = set()
+    for e in sorted(revenue_entries, key=lambda x: x["end"]):
+        if e["end"] in seen_ends:
+            continue
+        seen_ends.add(e["end"])
+        filings.append({
+            "fiscal_year_end": e["end"],
+            "filed": e["filed"],
+            "revenue": e["val"],
+            "net_income": net_income_by_end.get(e["end"]),
+            "operating_cash_flow": op_cash_flow_by_end.get(e["end"]),
+        })
 
+    # A single 10-K often discloses 2-3 years of comparative figures, so
+    # multiple fiscal years can legitimately share the same filed date.
+    # Only the most recent fiscal year per filing is a new "as of" point —
+    # the older ones don't change what get_financial_summary_asof returns
+    # for that date, so keep just one to avoid redundant DCF calls.
+    latest_per_filed = {}
+    for f in filings:
+        existing = latest_per_filed.get(f["filed"])
+        if existing is None or f["fiscal_year_end"] > existing["fiscal_year_end"]:
+            latest_per_filed[f["filed"]] = f
+
+    return sorted(latest_per_filed.values(), key=lambda f: f["filed"])
+
+
+def _format_filing_summary(filings: list[dict]) -> str:
     lines = []
-    for end_date in years_available:
-        fy = end_date[:4]
-        line = f"FY{fy}: Revenue ${revenue[end_date]:,.0f}"
-        if end_date in net_income:
-            line += f", Net Income ${net_income[end_date]:,.0f}"
-        if end_date in op_cash_flow:
-            line += f", Operating Cash Flow ${op_cash_flow[end_date]:,.0f}"
+    for f in filings:
+        fy = f["fiscal_year_end"][:4]
+        line = f"FY{fy}: Revenue ${f['revenue']:,.0f}"
+        if f["net_income"] is not None:
+            line += f", Net Income ${f['net_income']:,.0f}"
+        if f["operating_cash_flow"] is not None:
+            line += f", Operating Cash Flow ${f['operating_cash_flow']:,.0f}"
         lines.append(line)
-
     return "\n".join(lines)
+
+
+def get_financial_summary(ticker: str, years: int = 3) -> str:
+    """
+    Real revenue/net income/operating cash flow for the most recent N
+    fiscal years — used as the DCF module's filing_context so it
+    projects from real filed numbers rather than text scraped out of a
+    10-K. For live/current-day use; see get_financial_summary_asof for
+    point-in-time (backtesting) use.
+    """
+    filings = get_annual_filings(ticker)
+    if not filings:
+        return "No structured revenue data found in SEC filings for this ticker."
+    return _format_filing_summary(filings[-years:])
+
+
+def get_financial_summary_asof(ticker: str, as_of: str, years: int = 3) -> str:
+    """
+    Same as get_financial_summary, but restricted to filings that were
+    actually public by `as_of` (an ISO date string) — i.e. filed <=
+    as_of. This is what makes point-in-time backtesting honest: on any
+    given historical date, the DCF only sees what a trader actually
+    could have seen that day, never a future filing.
+    """
+    filings = [f for f in get_annual_filings(ticker) if f["filed"] <= as_of]
+    if not filings:
+        return "No SEC filings available as of this date."
+    return _format_filing_summary(filings[-years:])

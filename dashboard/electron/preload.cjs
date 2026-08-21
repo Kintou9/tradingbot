@@ -1,4 +1,8 @@
-// Intentionally minimal — the renderer talks to the FastAPI backend
-// directly over HTTP (see src/api.js), so no IPC bridge is needed yet.
-// Kept as a file (rather than omitted) so contextIsolation has a defined,
-// empty attack surface instead of the Electron default preload.
+const { contextBridge, ipcRenderer } = require("electron");
+
+// The only bridge exposed to the renderer: fetching the API token it
+// needs to authenticate to the FastAPI backend. Everything else the
+// renderer needs, it gets over plain HTTP (see src/api.js).
+contextBridge.exposeInMainWorld("electronAPI", {
+  getApiToken: () => ipcRenderer.invoke("get-api-token"),
+});

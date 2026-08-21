@@ -60,5 +60,4 @@ def run_technical_scan(ticker: str, ohlcv_df) -> dict:
     prompt = SCANNER_PROMPT_TEMPLATE.format(ticker=ticker, indicator_summary=indicator_summary)
 
     raw_text, structured = call_and_extract_json(client, "claude-sonnet-5", prompt, max_tokens=2500)
-    # TODO: store raw_text + structured via ResearchNote
     return {"raw_output": raw_text, "computed_levels": levels, "structured": structured}

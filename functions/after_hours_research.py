@@ -26,15 +26,26 @@ from engine.price_action_engine.technical_scanner import run_technical_scan
 from engine.news_sentiment.sentiment import fetch_news, score_sentiment
 from db.session import SessionLocal
 from db.models import NewsItem, ResearchNote
+from notifications.sms import notify_error, notify_daily_summary
 
 WATCHLIST = ["PLTR", "AVGO", "MSFT", "NOW", "CRWD", "AVPT", "DDOG", "SNOW", "CLFD", "AGYS"]
 NEWS_LOOKBACK_DAYS = 7
 
 
 def run_after_hours_research():
+    try:
+        notes_generated = _run_research_cycle()
+    except Exception as exc:
+        notify_error("after_hours_research", exc)
+        raise
+    notify_daily_summary(len(WATCHLIST), notes_generated)
+
+
+def _run_research_cycle() -> int:
     today = datetime.now(timezone.utc).date()
     from_date = (today - timedelta(days=NEWS_LOOKBACK_DAYS)).isoformat()
     to_date = today.isoformat()
+    notes_generated = 0
 
     db = SessionLocal()
     try:
@@ -80,6 +91,7 @@ def run_after_hours_research():
                     raw_output=technical_result["raw_output"],
                     structured_output=json.dumps(structured),
                 ))
+                notes_generated += 1
 
             company_name = get_company_name(ticker)
             if company_name is None:
@@ -109,6 +121,7 @@ def run_after_hours_research():
                     raw_output=deep_dive_result["raw_output"],
                     structured_output=json.dumps(structured),
                 ))
+                notes_generated += 1
 
                 filing_context = get_financial_summary(ticker)
                 dcf_result = run_dcf(ticker, company_name=company_name, filing_context=filing_context)
@@ -119,12 +132,14 @@ def run_after_hours_research():
                     raw_output=dcf_result["raw_output"],
                     structured_output=json.dumps(structured),
                 ))
+                notes_generated += 1
             except Exception as exc:
                 print(f"Skipping deep_dive/dcf for {ticker}: {exc}")
 
             db.commit()
 
         print(f"After-hours research complete for {len(WATCHLIST)} tickers.")
+        return notes_generated
     finally:
         db.close()
 

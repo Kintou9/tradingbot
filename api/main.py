@@ -11,11 +11,12 @@ API directly (the API is for observing/controlling the bot, not
 running the trading loop itself).
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import json
 import os
+import secrets
 
 from broker.alpaca_client import get_positions as get_broker_positions
 from db.session import SessionLocal
@@ -26,18 +27,37 @@ from functions.after_hours_research import WATCHLIST
 
 load_dotenv()
 
+DASHBOARD_API_TOKEN = os.getenv("DASHBOARD_API_TOKEN")
+
 app = FastAPI(title="Trading Bot API")
 
 # The dashboard is a separate Electron/Vite process on its own origin
-# (localhost:5173 in dev, an opaque file:// origin once packaged) — needs
-# CORS to call this API. Wide open is fine here: this API is bound to
-# localhost for a single-user desktop app, not exposed publicly.
+# (localhost:5173 in dev, an opaque "null" origin once packaged and
+# loaded via file://). Token auth (below) is the real access control —
+# CORS is browser-enforced only and does nothing against a non-browser
+# client — but explicit origins are still worth it as defense in depth
+# over a bare wildcard.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "null"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def require_token(x_api_token: str | None = Header(default=None)):
+    """
+    Every endpoint except /health requires this. Without it, CORS
+    was the only thing standing between a malicious webpage open in the
+    user's browser and this API's /kill-switch — CORS blocks a browser
+    from reading the response, but with allow_origins=["*"] it doesn't
+    stop the request from firing in the first place. A shared secret
+    the attacker can't know closes that off regardless of origin.
+    """
+    if not DASHBOARD_API_TOKEN:
+        raise HTTPException(status_code=500, detail="DASHBOARD_API_TOKEN is not configured on the server.")
+    if not x_api_token or not secrets.compare_digest(x_api_token, DASHBOARD_API_TOKEN):
+        raise HTTPException(status_code=401, detail="Missing or invalid API token.")
 
 
 @app.get("/health")
@@ -45,12 +65,12 @@ def health():
     return {"status": "ok", "trading_mode": os.getenv("TRADING_MODE", "paper")}
 
 
-@app.get("/status")
+@app.get("/status", dependencies=[Depends(require_token)])
 def status():
     return {"bot_enabled": is_bot_enabled()}
 
 
-@app.post("/kill-switch")
+@app.post("/kill-switch", dependencies=[Depends(require_token)])
 def kill_switch():
     """Manual kill switch — halts the bot from taking new trades.
     Wire this up to a button on your dashboard."""
@@ -58,13 +78,13 @@ def kill_switch():
     return {"bot_enabled": False, "message": "Trading halted."}
 
 
-@app.post("/resume")
+@app.post("/resume", dependencies=[Depends(require_token)])
 def resume():
     set_bot_enabled(True, reason="manual resume")
     return {"bot_enabled": True, "message": "Trading resumed."}
 
 
-@app.get("/positions")
+@app.get("/positions", dependencies=[Depends(require_token)])
 def get_positions():
     positions = get_broker_positions()
     return {
@@ -81,7 +101,7 @@ def get_positions():
     }
 
 
-@app.get("/trades")
+@app.get("/trades", dependencies=[Depends(require_token)])
 def get_trades():
     db = SessionLocal()
     try:
@@ -103,12 +123,12 @@ def get_trades():
         db.close()
 
 
-@app.get("/watchlist")
+@app.get("/watchlist", dependencies=[Depends(require_token)])
 def get_watchlist():
     return {"watchlist": WATCHLIST}
 
 
-@app.get("/news")
+@app.get("/news", dependencies=[Depends(require_token)])
 def get_news(ticker: str | None = None, limit: int = 50):
     db = SessionLocal()
     try:
@@ -133,7 +153,7 @@ def get_news(ticker: str | None = None, limit: int = 50):
         db.close()
 
 
-@app.get("/research")
+@app.get("/research", dependencies=[Depends(require_token)])
 def get_research(ticker: str | None = None, module: str | None = None, limit: int = 50):
     """Latest cached output from the after-hours LLM analyst modules
     (technical_scan, deep_dive, dcf) — see db/models.py ResearchNote."""
@@ -163,7 +183,7 @@ def get_research(ticker: str | None = None, module: str | None = None, limit: in
         db.close()
 
 
-@app.get("/chart/{ticker}")
+@app.get("/chart/{ticker}", dependencies=[Depends(require_token)])
 def get_chart(ticker: str, interval: str = "1day", outputsize: int = 100):
     """Real OHLCV bars for the dashboard's price chart — same Twelve Data
     feed the technical scanner runs on, not a separate/fabricated source."""

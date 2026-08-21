@@ -54,5 +54,4 @@ Institutional activity (most recent 13F filings): {institutional_data}
     prompt = DEEP_DIVE_PROMPT_TEMPLATE.format(ticker=ticker) + context
 
     raw_text, structured = call_and_extract_json(client, "claude-sonnet-5", prompt, max_tokens=3000)
-    # TODO: store raw_text + structured via ResearchNote
     return {"raw_output": raw_text, "structured": structured}
