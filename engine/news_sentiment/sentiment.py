@@ -37,8 +37,10 @@ Summary: {summary}
         max_tokens=10,
         messages=[{"role": "user", "content": prompt}],
     )
-    raw_text = next(block.text for block in response.content if block.type == "text")
+    text_blocks = [block.text for block in response.content if block.type == "text"]
+    if not text_blocks:
+        return 0.0
     try:
-        return float(raw_text.strip())
+        return float(text_blocks[0].strip())
     except ValueError:
         return 0.0
