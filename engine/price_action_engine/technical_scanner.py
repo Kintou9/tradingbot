@@ -23,7 +23,7 @@ given — say "not enough data" rather than inventing a number), assess the setu
 Computed data:
 {indicator_summary}
 
-Cover each of these 8 points, in order, briefly:
+Cover each of these 9 points, in order, briefly:
 1. Trend direction — price relative to the 50DMA and 200DMA.
 2. Support & resistance — the horizontal levels given above; note any Fibonacci
    retracement levels only if they can be derived from the provided price data.
@@ -32,8 +32,15 @@ Cover each of these 8 points, in order, briefly:
    implies for momentum.
 5. MACD signal — bullish/bearish crossover state, if MACD values are given.
 6. Bollinger Bands signal — price position relative to the bands, if given.
-7. Proposed entry range and stop-loss level.
-8. Two price targets (target_1, target_2), the resulting reward:risk ratio, and a
+7. Mean reversion — the 20-period z-score and %B given above measure how far
+   price has stretched from its short-term average. A stretched reading
+   (|z-score| > 2, or %B near 0/1) is only a reason to expect reversion if
+   nothing else here explains it — weigh it against trend, RSI, and volume
+   rather than treating an oversold or overbought reading in isolation. Don't
+   suggest fading a strong, high-volume trend just because %B or z-score is
+   extreme.
+8. Proposed entry range and stop-loss level.
+9. Two price targets (target_1, target_2), the resulting reward:risk ratio, and a
    probability-of-success estimate (0-100) for the trade reaching target_1 before
    the stop-loss.
 
@@ -41,7 +48,8 @@ Your response MUST end with this exact JSON block and nothing after it — this 
 required output, not optional:
 {{"ticker": "...", "trend": "up|down|range", "entry_price": 0.0,
   "stop_loss": 0.0, "target_1": 0.0, "target_2": 0.0,
-  "reward_risk_ratio": 0.0, "probability_estimate": 0}}
+  "reward_risk_ratio": 0.0, "probability_estimate": 0,
+  "mean_reversion_bias": "oversold|neutral|overbought"}}
 """
 
 
@@ -55,6 +63,8 @@ def run_technical_scan(ticker: str, ohlcv_df) -> dict:
     SMA50: {latest.get('sma_50')}, SMA200: {latest.get('sma_200')}
     RSI(14): {latest.get('rsi_14')}
     Support: {levels['support']}, Resistance: {levels['resistance']}
+    20-period z-score vs SMA20: {latest.get('zscore_20')}
+    Bollinger %B (20-period): {latest.get('bb_percent_b')}
     """
 
     prompt = SCANNER_PROMPT_TEMPLATE.format(ticker=ticker, indicator_summary=indicator_summary)

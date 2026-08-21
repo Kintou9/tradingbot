@@ -24,6 +24,16 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     bbands = ta.bbands(df["close"], length=20)
     df = pd.concat([df, bbands], axis=1)
 
+    # Mean-reversion primitives: how far price has stretched from its
+    # short-term average, in standard-deviation terms. %B comes straight
+    # out of the Bollinger Bands above (0 = at lower band, 1 = at upper
+    # band); the z-score is the same idea computed directly so it doesn't
+    # depend on pandas-ta's column-naming scheme.
+    df["sma_20"] = ta.sma(df["close"], length=20)
+    df["zscore_20"] = (df["close"] - df["sma_20"]) / df["close"].rolling(20).std()
+    bbp_col = next((c for c in bbands.columns if c.startswith("BBP_")), None)
+    df["bb_percent_b"] = df[bbp_col] if bbp_col else None
+
     return df
 
 

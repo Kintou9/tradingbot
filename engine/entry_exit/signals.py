@@ -47,7 +47,10 @@ def evaluate_entry(
         (keys: estimated_fair_value_per_share, wacc, terminal_growth_rate, ...)
     technical_result: the "structured" dict from
         engine.price_action_engine.technical_scanner.run_technical_scan
-        (keys: trend, entry_price, stop_loss, target_1, target_2, probability_estimate)
+        (keys: trend, entry_price, stop_loss, target_1, target_2,
+        probability_estimate, mean_reversion_bias — the LLM's own read of
+        the z-score/%B mean-reversion context, already folded into
+        probability_estimate; not gated on separately here)
     sentiment_score: -1.0 (very bearish) to 1.0 (very bullish), see
         engine.news_sentiment.sentiment.score_sentiment
     """
