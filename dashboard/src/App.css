@@ -294,6 +294,50 @@
   text-transform: capitalize;
 }
 
+.watcher-form {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.watcher-input {
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.watcher-input-notes {
+  flex: 1;
+}
+
+.watcher-add-button {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.watcher-add-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.watcher-remove-button {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--status-critical);
+  font-size: 12px;
+  cursor: pointer;
+}
+
 .trend-up,
 .verdict-buy {
   background: color-mix(in srgb, var(--status-good) 18%, transparent);

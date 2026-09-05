@@ -22,9 +22,27 @@ async function get(path) {
   return res.json();
 }
 
-async function post(path) {
-  const res = await fetch(`${BASE_URL}${path}`, { method: "POST", headers: await authHeaders() });
-  if (!res.ok) throw new Error(`${path} failed: ${res.status}`);
+async function post(path, body) {
+  const headers = await authHeaders();
+  const options = { method: "POST", headers };
+  if (body !== undefined) {
+    options.headers = { ...headers, "Content-Type": "application/json" };
+    options.body = JSON.stringify(body);
+  }
+  const res = await fetch(`${BASE_URL}${path}`, options);
+  if (!res.ok) {
+    const detail = await res.json().catch(() => null);
+    throw new Error(detail?.detail || `${path} failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+async function del(path) {
+  const res = await fetch(`${BASE_URL}${path}`, { method: "DELETE", headers: await authHeaders() });
+  if (!res.ok) {
+    const detail = await res.json().catch(() => null);
+    throw new Error(detail?.detail || `${path} failed: ${res.status}`);
+  }
   return res.json();
 }
 
@@ -38,6 +56,9 @@ export const api = {
   trades: () => get("/trades"),
   tradesSummary: () => get("/trades/summary"),
   watchlist: () => get("/watchlist"),
+  watched: () => get("/watched"),
+  addWatched: (ticker, notes) => post("/watched", { ticker, notes: notes || null }),
+  removeWatched: (ticker) => del(`/watched/${ticker}`),
   news: (ticker) => get(`/news${ticker ? `?ticker=${ticker}` : ""}`),
   research: (ticker) => get(`/research${ticker ? `?ticker=${ticker}` : ""}`),
   chart: (ticker, outputsize = 100) => get(`/chart/${ticker}?outputsize=${outputsize}`),

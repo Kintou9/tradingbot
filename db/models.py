@@ -64,6 +64,18 @@ class NewsItem(Base):
     ingested_at = Column(DateTime, default=datetime.utcnow)
 
 
+class WatchedTicker(Base):
+    """Personal candidate list — tickers the user is considering but hasn't
+    added to the bot's own automated WATCHLIST (functions/*.py) yet. Purely
+    for tracking; adding a ticker here does not trigger research or trading."""
+    __tablename__ = "watched_tickers"
+
+    id = Column(Integer, primary_key=True)
+    ticker = Column(String, unique=True, index=True)
+    notes = Column(Text, nullable=True)
+    added_at = Column(DateTime, default=datetime.utcnow)
+
+
 class KillSwitchLog(Base):
     """Audit trail every time the bot is halted/resumed, and why."""
     __tablename__ = "kill_switch_log"

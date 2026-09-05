@@ -5,9 +5,10 @@ import OverviewPanel from "./components/OverviewPanel";
 import TradesPanel from "./components/TradesPanel";
 import NewsPanel from "./components/NewsPanel";
 import ChartPanel from "./components/ChartPanel";
+import WatcherPanel from "./components/WatcherPanel";
 import "./App.css";
 
-const TABS = ["Overview", "Chart", "News", "Trades"];
+const TABS = ["Overview", "Chart", "News", "Trades", "Watcher"];
 
 function App() {
   const [tab, setTab] = useState("Overview");
@@ -56,6 +57,7 @@ function App() {
           {tab === "Chart" && ticker && <ChartPanel ticker={ticker} />}
           {tab === "News" && <NewsPanel ticker={ticker} />}
           {tab === "Trades" && <TradesPanel />}
+          {tab === "Watcher" && <WatcherPanel />}
         </main>
       </div>
     </div>

@@ -13,6 +13,7 @@ running the trading loop itself).
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from dotenv import load_dotenv
 import json
 import os
@@ -21,7 +22,7 @@ import secrets
 from broker.alpaca_client import get_account as get_broker_account, get_positions as get_broker_positions
 from db.analytics import compute_trade_summary
 from db.session import SessionLocal
-from db.models import KillSwitchLog, Position, Trade, NewsItem, ResearchNote
+from db.models import KillSwitchLog, Position, Trade, NewsItem, ResearchNote, WatchedTicker
 from db.kill_switch import is_bot_enabled, set_bot_enabled
 from engine.price_action_engine.market_data import fetch_ohlcv
 from functions.after_hours_research import WATCHLIST
@@ -183,6 +184,77 @@ def get_trades_summary():
 @app.get("/watchlist", dependencies=[Depends(require_token)])
 def get_watchlist():
     return {"watchlist": WATCHLIST}
+
+
+class WatchedTickerCreate(BaseModel):
+    ticker: str
+    notes: str | None = None
+
+
+@app.get("/watched", dependencies=[Depends(require_token)])
+def get_watched():
+    """Personal candidate list (db.models.WatchedTicker) — separate from
+    the bot's own WATCHLIST above. Includes the latest cached research
+    verdict/trend for a watched ticker if any already exists, purely as a
+    convenience; being on this list never triggers research or trading."""
+    db = SessionLocal()
+    try:
+        watched = db.query(WatchedTicker).order_by(WatchedTicker.added_at.desc()).all()
+        result = []
+        for w in watched:
+            deep_dive = (
+                db.query(ResearchNote)
+                .filter(ResearchNote.ticker == w.ticker, ResearchNote.module == "deep_dive")
+                .order_by(ResearchNote.created_at.desc())
+                .first()
+            )
+            technical = (
+                db.query(ResearchNote)
+                .filter(ResearchNote.ticker == w.ticker, ResearchNote.module == "technical_scan")
+                .order_by(ResearchNote.created_at.desc())
+                .first()
+            )
+            result.append({
+                "ticker": w.ticker,
+                "notes": w.notes,
+                "added_at": w.added_at.isoformat(),
+                "latest_verdict": deep_dive.verdict if deep_dive else None,
+                "latest_trend": technical.verdict if technical else None,
+            })
+        return {"watched": result}
+    finally:
+        db.close()
+
+
+@app.post("/watched", dependencies=[Depends(require_token)])
+def add_watched(body: WatchedTickerCreate):
+    ticker = body.ticker.strip().upper()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="Ticker is required.")
+    db = SessionLocal()
+    try:
+        existing = db.query(WatchedTicker).filter(WatchedTicker.ticker == ticker).first()
+        if existing:
+            raise HTTPException(status_code=409, detail=f"{ticker} is already on the watch list.")
+        db.add(WatchedTicker(ticker=ticker, notes=body.notes))
+        db.commit()
+        return {"ticker": ticker, "notes": body.notes}
+    finally:
+        db.close()
+
+
+@app.delete("/watched/{ticker}", dependencies=[Depends(require_token)])
+def remove_watched(ticker: str):
+    db = SessionLocal()
+    try:
+        existing = db.query(WatchedTicker).filter(WatchedTicker.ticker == ticker.upper()).first()
+        if not existing:
+            raise HTTPException(status_code=404, detail=f"{ticker.upper()} is not on the watch list.")
+        db.delete(existing)
+        db.commit()
+        return {"removed": ticker.upper()}
+    finally:
+        db.close()
 
 
 @app.get("/news", dependencies=[Depends(require_token)])
