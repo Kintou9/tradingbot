@@ -25,6 +25,7 @@ from db.session import SessionLocal
 from db.models import KillSwitchLog, Position, Trade, NewsItem, ResearchNote, WatchedTicker
 from db.kill_switch import is_bot_enabled, set_bot_enabled
 from engine.price_action_engine.market_data import fetch_ohlcv
+from engine.valuation_engine.fundamentals_data import get_company_name
 from functions.after_hours_research import WATCHLIST
 
 load_dotenv()
@@ -214,12 +215,25 @@ def get_watched():
                 .order_by(ResearchNote.created_at.desc())
                 .first()
             )
+            try:
+                company_name = get_company_name(w.ticker)
+            except Exception:
+                company_name = None
             result.append({
                 "ticker": w.ticker,
+                "company_name": company_name,
                 "notes": w.notes,
                 "added_at": w.added_at.isoformat(),
                 "latest_verdict": deep_dive.verdict if deep_dive else None,
                 "latest_trend": technical.verdict if technical else None,
+                "deep_dive": {
+                    "structured": json.loads(deep_dive.structured_output) if deep_dive and deep_dive.structured_output else None,
+                    "created_at": deep_dive.created_at.isoformat(),
+                } if deep_dive else None,
+                "technical": {
+                    "structured": json.loads(technical.structured_output) if technical and technical.structured_output else None,
+                    "created_at": technical.created_at.isoformat(),
+                } if technical else None,
             })
         return {"watched": result}
     finally:

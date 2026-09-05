@@ -328,6 +328,59 @@
   cursor: default;
 }
 
+.watcher-row {
+  cursor: pointer;
+}
+
+.watcher-row:hover {
+  background: var(--surface-2);
+}
+
+.watcher-caret {
+  display: inline-block;
+  width: 12px;
+  margin-right: 6px;
+  color: var(--text-muted);
+  transition: transform 0.15s ease;
+}
+
+.watcher-caret-open {
+  transform: rotate(90deg);
+}
+
+.watcher-detail-row td {
+  padding: 16px 10px 20px;
+  background: var(--surface-1);
+}
+
+.watcher-detail {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.watcher-detail-label {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.watcher-detail-list {
+  margin: 4px 0 0;
+  padding-left: 16px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.watcher-detail-list li {
+  margin-bottom: 3px;
+}
+
+.watcher-detail-date {
+  margin-top: 10px;
+  font-size: 11px;
+}
+
 .watcher-remove-button {
   padding: 4px 10px;
   border-radius: 6px;
