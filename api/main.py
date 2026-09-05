@@ -18,9 +18,10 @@ import json
 import os
 import secrets
 
-from broker.alpaca_client import get_positions as get_broker_positions
+from broker.alpaca_client import get_account as get_broker_account, get_positions as get_broker_positions
+from db.analytics import compute_trade_summary
 from db.session import SessionLocal
-from db.models import Trade, NewsItem, ResearchNote
+from db.models import KillSwitchLog, Position, Trade, NewsItem, ResearchNote
 from db.kill_switch import is_bot_enabled, set_bot_enabled
 from engine.price_action_engine.market_data import fetch_ohlcv
 from functions.after_hours_research import WATCHLIST
@@ -28,6 +29,12 @@ from functions.after_hours_research import WATCHLIST
 load_dotenv()
 
 DASHBOARD_API_TOKEN = os.getenv("DASHBOARD_API_TOKEN")
+
+# Mirrors functions/market_hours_trading.py's own constant — the dashboard
+# only needs to *display* the limit, not enforce it, so it reads the same
+# env var rather than importing that module (which stands up its own
+# broker/trading-loop wiring at import time).
+DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.10"))
 
 app = FastAPI(title="Trading Bot API")
 
@@ -67,7 +74,35 @@ def health():
 
 @app.get("/status", dependencies=[Depends(require_token)])
 def status():
-    return {"bot_enabled": is_bot_enabled()}
+    db = SessionLocal()
+    try:
+        latest_log = db.query(KillSwitchLog).order_by(KillSwitchLog.id.desc()).first()
+    finally:
+        db.close()
+    return {
+        "bot_enabled": is_bot_enabled(),
+        "kill_switch_reason": latest_log.reason if latest_log else None,
+        "kill_switch_timestamp": latest_log.timestamp.isoformat() if latest_log else None,
+    }
+
+
+@app.get("/account", dependencies=[Depends(require_token)])
+def get_account_summary():
+    """Live equity + today's P&L from Alpaca, plus how much of the daily
+    loss limit (Section 7 risk management) has been used up so far."""
+    account = get_broker_account()
+    equity = float(account.equity)
+    last_equity = float(account.last_equity)
+    daily_pl = equity - last_equity
+    daily_pl_pct = (daily_pl / last_equity) if last_equity else 0.0
+    loss_used_pct = max(0.0, -daily_pl_pct)
+    return {
+        "equity": equity,
+        "daily_pl": daily_pl,
+        "daily_pl_pct": daily_pl_pct,
+        "daily_loss_limit_pct": DAILY_LOSS_LIMIT_PCT,
+        "daily_loss_headroom_pct": max(0.0, DAILY_LOSS_LIMIT_PCT - loss_used_pct),
+    }
 
 
 @app.post("/kill-switch", dependencies=[Depends(require_token)])
@@ -87,6 +122,14 @@ def resume():
 @app.get("/positions", dependencies=[Depends(require_token)])
 def get_positions():
     positions = get_broker_positions()
+    db = SessionLocal()
+    try:
+        # Live broker positions have no concept of "our" stop/take-profit
+        # levels — those only exist in our own Position rows, keyed by
+        # ticker, from when the bot opened the trade.
+        tracked = {p.ticker: p for p in db.query(Position).all()}
+    finally:
+        db.close()
     return {
         "positions": [
             {
@@ -95,6 +138,8 @@ def get_positions():
                 "avg_entry_price": float(p.avg_entry_price),
                 "current_price": float(p.current_price),
                 "unrealized_pl": float(p.unrealized_pl),
+                "stop_loss_price": tracked[p.symbol].stop_loss_price if p.symbol in tracked else None,
+                "take_profit_price": tracked[p.symbol].take_profit_price if p.symbol in tracked else None,
             }
             for p in positions
         ]
@@ -119,6 +164,18 @@ def get_trades():
                 for t in trades
             ]
         }
+    finally:
+        db.close()
+
+
+@app.get("/trades/summary", dependencies=[Depends(require_token)])
+def get_trades_summary():
+    """Realized P&L and win rate across all logged trades, via FIFO lot
+    matching (see db/analytics.py) — /trades only returns raw fills."""
+    db = SessionLocal()
+    try:
+        trades = db.query(Trade).order_by(Trade.timestamp.asc()).all()
+        return compute_trade_summary(trades)
     finally:
         db.close()
 

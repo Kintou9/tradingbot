@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "./api";
 import StatusBar from "./components/StatusBar";
-import PositionsPanel from "./components/PositionsPanel";
+import OverviewPanel from "./components/OverviewPanel";
 import TradesPanel from "./components/TradesPanel";
 import NewsPanel from "./components/NewsPanel";
 import ChartPanel from "./components/ChartPanel";
@@ -52,7 +52,7 @@ function App() {
         </header>
 
         <main className="content">
-          {tab === "Overview" && <PositionsPanel />}
+          {tab === "Overview" && <OverviewPanel />}
           {tab === "Chart" && ticker && <ChartPanel ticker={ticker} />}
           {tab === "News" && <NewsPanel ticker={ticker} />}
           {tab === "Trades" && <TradesPanel />}

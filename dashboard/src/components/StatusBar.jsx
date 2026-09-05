@@ -51,6 +51,9 @@ export default function StatusBar() {
     <div className="status-bar">
       <span className={`status-dot ${enabled ? "status-dot-good" : "status-dot-critical"}`} />
       <span className="status-label">{enabled ? "Bot active" : "Trading halted"}</span>
+      {!enabled && status?.kill_switch_reason && (
+        <span className="status-reason text-muted">({status.kill_switch_reason})</span>
+      )}
       <button
         className={`kill-switch-button ${enabled ? "kill" : "resume"}`}
         onClick={toggle}

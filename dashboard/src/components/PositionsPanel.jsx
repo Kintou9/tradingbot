@@ -5,6 +5,10 @@ function fmtMoney(n) {
   return n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 }
 
+function fmtMoneyOrDash(n) {
+  return n == null ? "—" : fmtMoney(n);
+}
+
 export default function PositionsPanel() {
   const [positions, setPositions] = useState(null);
   const [error, setError] = useState(null);
@@ -37,6 +41,8 @@ export default function PositionsPanel() {
           <th>Qty</th>
           <th>Avg Entry</th>
           <th>Current Price</th>
+          <th>Stop Loss</th>
+          <th>Take Profit</th>
           <th>Unrealized P&amp;L</th>
         </tr>
       </thead>
@@ -49,6 +55,8 @@ export default function PositionsPanel() {
               <td>{p.qty}</td>
               <td>{fmtMoney(p.avg_entry_price)}</td>
               <td>{fmtMoney(p.current_price)}</td>
+              <td className="text-muted">{fmtMoneyOrDash(p.stop_loss_price)}</td>
+              <td className="text-muted">{fmtMoneyOrDash(p.take_profit_price)}</td>
               <td className={positive ? "text-good" : "text-critical"}>
                 {positive ? "+" : ""}
                 {fmtMoney(p.unrealized_pl)}

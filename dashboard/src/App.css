@@ -90,6 +90,10 @@
   color: var(--text-secondary);
 }
 
+.status-reason {
+  font-size: 12px;
+}
+
 .kill-switch-button {
   margin-left: 8px;
   padding: 6px 12px;
@@ -204,6 +208,27 @@
 
 .news-headline:hover {
   text-decoration: underline;
+}
+
+.overview {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.overview-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.section-heading {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .chart-panel {
