@@ -59,6 +59,13 @@ def evaluate_entry(
     if not fair_value or not entry_price or entry_price <= 0:
         return None
 
+    # A DCF whose per-share figure rests on a share count the model pulled
+    # from memory rather than the filing is unreliable by multiples — don't
+    # trade the discount it implies. (Set by engine.valuation_engine.dcf
+    # when "Diluted Shares Outstanding" is absent from the filing context.)
+    if valuation_result.get("share_count_source") == "unavailable":
+        return None
+
     if technical_result.get("trend") == "down":
         return None
 

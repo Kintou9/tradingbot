@@ -26,6 +26,13 @@ explicit forecast horizon plus a terminal value.
 Use ONLY the filing context provided below — do not invent revenue, margin, or
 share-count figures not present in it; say "data not available" instead.
 
+The filing context includes "Diluted Shares Outstanding" for each fiscal year.
+Use the most recent one as the share count when converting equity value to fair
+value per share — do NOT substitute a share count from your own memory. If (and
+only if) no diluted share count appears in the filing context, state clearly in
+step 5 that the per-share figure is unreliable because the share count is
+unavailable, and set "share_count_source" to "unavailable" in the JSON block.
+
 Work through these steps, briefly:
 1. Summarize the starting revenue, FCF margin, and growth trajectory from the
    filing context.
@@ -43,7 +50,9 @@ Work through these steps, briefly:
 Your response MUST end with this exact JSON block and nothing after it — this is
 required output, not optional:
 {{"ticker": "...", "estimated_fair_value_per_share": 0.0, "wacc": 0.0,
-  "terminal_growth_rate": 0.0, "most_sensitive_assumptions": ["...", "...", "..."]}}
+  "terminal_growth_rate": 0.0, "diluted_shares_outstanding": 0.0,
+  "share_count_source": "filing",
+  "most_sensitive_assumptions": ["...", "...", "..."]}}
 """
 
 

@@ -151,7 +151,9 @@ def get_annual_filings(ticker: str) -> list[dict]:
     if resp.status_code != 200:
         return []
 
-    facts = resp.json().get("facts", {}).get("us-gaap", {})
+    all_facts = resp.json().get("facts", {})
+    facts = all_facts.get("us-gaap", {})
+    dei_facts = all_facts.get("dei", {})
 
     def is_genuinely_annual(e: dict) -> bool:
         """form=="10-K" and fp=="FY" alone isn't reliable — some filers'
@@ -165,9 +167,9 @@ def get_annual_filings(ticker: str) -> list[dict]:
             return False
         return 340 <= (end - start).days <= 380
 
-    def annual_entries(tag_candidates: list[str]) -> list[dict]:
+    def annual_entries(tag_candidates: list[str], unit: str = "USD") -> list[dict]:
         for tag in tag_candidates:
-            entries = facts.get(tag, {}).get("units", {}).get("USD", [])
+            entries = facts.get(tag, {}).get("units", {}).get(unit, [])
             annual = [
                 e for e in entries
                 if e.get("form") == "10-K" and e.get("fp") == "FY" and is_genuinely_annual(e)
@@ -175,6 +177,27 @@ def get_annual_filings(ticker: str) -> list[dict]:
             if annual:
                 return annual
         return []
+
+    def instant_shares_by_end(tag_candidates: list[str]) -> dict:
+        """Balance-sheet share counts are instantaneous (no `start`), so
+        is_genuinely_annual can't vet them — match them to a fiscal-year
+        end date directly instead. Used only as a fallback when the
+        weighted-average diluted count (the DCF's preferred denominator)
+        isn't tagged."""
+        for tag in tag_candidates:
+            entries = dei_facts.get(tag, {}).get("units", {}).get("shares", []) \
+                or facts.get(tag, {}).get("units", {}).get("shares", [])
+            by_end = {}
+            for e in entries:
+                if e.get("form") == "10-K" and e.get("end"):
+                    # keep the value from the earliest filing that reported
+                    # this period end — that's the point-in-time-correct one
+                    prev = by_end.get(e["end"])
+                    if prev is None or e.get("filed", "") < prev.get("filed", ""):
+                        by_end[e["end"]] = e
+            if by_end:
+                return {end: e["val"] for end, e in by_end.items()}
+        return {}
 
     revenue_entries = annual_entries([
         "RevenueFromContractWithCustomerExcludingAssessedTax",
@@ -184,6 +207,28 @@ def get_annual_filings(ticker: str) -> list[dict]:
     ])
     net_income_by_end = {e["end"]: e["val"] for e in annual_entries(["NetIncomeLoss"])}
     op_cash_flow_by_end = {e["end"]: e["val"] for e in annual_entries(["NetCashProvidedByUsedInOperatingActivities"])}
+
+    # Diluted share count — the denominator the DCF needs to turn equity
+    # value into fair value per share. Without this in the filing context
+    # the LLM guesses it from memory, and a stale guess (splits, buybacks,
+    # dilution) throws the per-share output off by multiples. Prefer the
+    # weighted-average diluted figure from the income statement; fall back
+    # to basic, then to a balance-sheet / cover-page shares-outstanding
+    # count.
+    diluted_shares_by_end = {
+        e["end"]: e["val"]
+        for e in annual_entries(["WeightedAverageNumberOfDilutedSharesOutstanding"], unit="shares")
+    }
+    if not diluted_shares_by_end:
+        diluted_shares_by_end = {
+            e["end"]: e["val"]
+            for e in annual_entries(["WeightedAverageNumberOfSharesOutstandingBasic"], unit="shares")
+        }
+    if not diluted_shares_by_end:
+        diluted_shares_by_end = instant_shares_by_end([
+            "CommonStockSharesOutstanding",
+            "EntityCommonStockSharesOutstanding",
+        ])
 
     filings = []
     seen_ends = set()
@@ -197,6 +242,7 @@ def get_annual_filings(ticker: str) -> list[dict]:
             "revenue": e["val"],
             "net_income": net_income_by_end.get(e["end"]),
             "operating_cash_flow": op_cash_flow_by_end.get(e["end"]),
+            "diluted_shares": diluted_shares_by_end.get(e["end"]),
         })
 
     # A single 10-K often discloses 2-3 years of comparative figures, so
@@ -222,6 +268,8 @@ def _format_filing_summary(filings: list[dict]) -> str:
             line += f", Net Income ${f['net_income']:,.0f}"
         if f["operating_cash_flow"] is not None:
             line += f", Operating Cash Flow ${f['operating_cash_flow']:,.0f}"
+        if f.get("diluted_shares") is not None:
+            line += f", Diluted Shares Outstanding {f['diluted_shares']:,.0f}"
         lines.append(line)
     return "\n".join(lines)
 
