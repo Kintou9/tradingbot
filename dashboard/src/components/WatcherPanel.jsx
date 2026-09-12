@@ -89,6 +89,60 @@ function WatcherDetail({ watched }) {
   );
 }
 
+function DiscoveryBanner({ onDiscovered }) {
+  const [status, setStatus] = useState(null);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState(null);
+
+  const refresh = () => {
+    api.discoveryStatus().then(setStatus).catch(() => {});
+  };
+
+  useEffect(refresh, []);
+
+  const handleRunNow = async () => {
+    if (
+      !window.confirm(
+        "Run stock discovery now? This adds up to 10 new tickers to the Watcher list " +
+          "(one per sector/theme, plus real computed low/high-volatility and momentum picks). " +
+          "It also counts as this week's automatic Friday run."
+      )
+    ) {
+      return;
+    }
+    setRunning(true);
+    setError(null);
+    try {
+      await api.runDiscoveryNow();
+      refresh();
+      onDiscovered();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div className="discovery-banner">
+      <div>
+        {status?.last_run_date ? (
+          <>
+            <span className="text-muted">Last auto-discovery {status.last_run_date}:</span>{" "}
+            {status.last_run_tickers.join(", ")}
+          </>
+        ) : (
+          <span className="text-muted">No discovery run yet — runs automatically every Friday after 4pm ET.</span>
+        )}
+        {error && <div className="panel-error">{error}</div>}
+      </div>
+      <button className="watcher-add-button" onClick={handleRunNow} disabled={running}>
+        {running ? "Running… (~1 min)" : "Discover Now"}
+      </button>
+    </div>
+  );
+}
+
 export default function WatcherPanel() {
   const [watched, setWatched] = useState(null);
   const [error, setError] = useState(null);
@@ -142,6 +196,7 @@ export default function WatcherPanel() {
 
   return (
     <div className="overview">
+      <DiscoveryBanner onDiscovered={refresh} />
       <form className="watcher-form" onSubmit={handleAdd}>
         <input
           className="watcher-input"

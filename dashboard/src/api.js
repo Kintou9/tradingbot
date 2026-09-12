@@ -62,4 +62,12 @@ export const api = {
   news: (ticker) => get(`/news${ticker ? `?ticker=${ticker}` : ""}`),
   research: (ticker) => get(`/research${ticker ? `?ticker=${ticker}` : ""}`),
   chart: (ticker, outputsize = 100) => get(`/chart/${ticker}?outputsize=${outputsize}`),
+  recommendations: () => get("/recommendations"),
+  buy: (ticker, qty) => post(`/positions/${ticker}/buy`, qty ? { qty } : {}),
+  sell: (ticker, qty) => post(`/positions/${ticker}/sell`, qty ? { qty } : {}),
+  autonomousStatus: () => get("/autonomous"),
+  enableAutonomous: () => post("/autonomous/enable"),
+  disableAutonomous: () => post("/autonomous/disable"),
+  discoveryStatus: () => get("/discovery"),
+  runDiscoveryNow: () => post("/discovery/run-now"),
 };

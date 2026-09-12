@@ -61,9 +61,12 @@ def evaluate_entry(
 
     # A DCF whose per-share figure rests on a share count the model pulled
     # from memory rather than the filing is unreliable by multiples — don't
-    # trade the discount it implies. (Set by engine.valuation_engine.dcf
-    # when "Diluted Shares Outstanding" is absent from the filing context.)
-    if valuation_result.get("share_count_source") == "unavailable":
+    # trade the discount it implies. Fail closed on anything except the
+    # explicit "filing" value: that covers both an explicit "unavailable"
+    # AND every DCF note cached before this field existed at all (reproduced
+    # live 2026-09-11 — a pre-fix cached NOW note showed a 418% "discount"
+    # from exactly this kind of stale guessed share count).
+    if valuation_result.get("share_count_source") != "filing":
         return None
 
     if technical_result.get("trend") == "down":

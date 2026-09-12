@@ -14,6 +14,10 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 
 def fetch_ohlcv(ticker: str, interval: str = "1day", outputsize: int = 100) -> pd.DataFrame:
+    """
+    interval: '1day', '1h', '15min', etc.
+    outputsize: number of most recent bars to pull (max 5000 on free tier)
+    """
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": ticker,
@@ -40,5 +44,6 @@ def fetch_ohlcv(ticker: str, interval: str = "1day", outputsize: int = 100) -> p
 
 
 if __name__ == "__main__":
+    # Quick manual test — run this file directly to confirm the fetch works
     df = fetch_ohlcv("AVPT")
     print(df.tail())

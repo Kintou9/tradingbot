@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import PositionsPanel from "./PositionsPanel";
 import TradesTable from "./TradesTable";
+import RecommendationsPanel from "./RecommendationsPanel";
 
 function fmtMoney(n) {
   return n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 2 });
@@ -33,11 +34,16 @@ export default function OverviewPanel() {
   }, []);
 
   useEffect(() => {
-    api.tradesSummary().then(setSummary).catch(() => {});
-    api
-      .trades()
-      .then((d) => setRecentTrades(d.trades.slice(0, 5)))
-      .catch(() => setRecentTrades([]));
+    const refresh = () => {
+      api.tradesSummary().then(setSummary).catch(() => {});
+      api
+        .trades()
+        .then((d) => setRecentTrades(d.trades.slice(0, 5)))
+        .catch(() => setRecentTrades([]));
+    };
+    refresh();
+    const id = setInterval(refresh, 20000);
+    return () => clearInterval(id);
   }, []);
 
   return (
@@ -101,6 +107,11 @@ export default function OverviewPanel() {
       <section className="overview-section">
         <h3 className="section-heading">Positions</h3>
         <PositionsPanel />
+      </section>
+
+      <section className="overview-section">
+        <h3 className="section-heading">What To Buy Next</h3>
+        <RecommendationsPanel />
       </section>
 
       <section className="overview-section">
