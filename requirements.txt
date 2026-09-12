@@ -12,3 +12,4 @@ twilio
 alpaca-py
 robin-stocks
 requests
+pytest

@@ -15,18 +15,32 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from datetime import date
+from zoneinfo import ZoneInfo
+import asyncio
+import datetime as dt
 import json
 import os
 import secrets
 
 from broker.alpaca_client import get_account as get_broker_account, get_positions as get_broker_positions
 from db.analytics import compute_trade_summary
-from db.session import SessionLocal
-from db.models import KillSwitchLog, Position, Trade, NewsItem, ResearchNote, WatchedTicker
+from db.session import SessionLocal, init_db
+from db.models import (
+    AutonomousModeLog, DiscoveryRunLog, KillSwitchLog, Position, Trade, NewsItem, ResearchNote, WatchedTicker,
+    SwingCandidateLog, SwingPosition, SwingTrade,
+)
 from db.kill_switch import is_bot_enabled, set_bot_enabled
+from db.autonomous_mode import is_autonomous_enabled, set_autonomous_enabled
+from db.swing_autonomous_mode import is_swing_autonomous_enabled, get_swing_autonomous_variant, set_swing_autonomous_enabled
+from engine.entry_exit.execution import execute_buy, execute_sell
 from engine.price_action_engine.market_data import fetch_ohlcv
 from engine.valuation_engine.fundamentals_data import get_company_name
+from engine.swing_strategy.config import SwingStrategyConfig, GateVariant
 from functions.after_hours_research import WATCHLIST
+from functions.market_hours_trading import MAX_POSITION_PCT, is_market_hours, run_market_hours_trading
+from functions.swing_paper_trading import run_swing_paper_cycle
+from functions.weekly_discovery import run_weekly_stock_discovery
 
 load_dotenv()
 
@@ -38,7 +52,107 @@ DASHBOARD_API_TOKEN = os.getenv("DASHBOARD_API_TOKEN")
 # broker/trading-loop wiring at import time).
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.10"))
 
+# How often the autonomous loop re-checks whether it should run a trading
+# cycle. run_market_hours_trading() is itself a no-op outside market hours
+# or while the kill switch is off, so this just controls how promptly a
+# newly-eligible signal gets acted on while autonomous mode is on.
+AUTONOMOUS_LOOP_INTERVAL_SECONDS = 300
+
 app = FastAPI(title="Trading Bot API")
+
+
+@app.on_event("startup")
+def _create_tables_if_missing():
+    init_db()
+
+
+@app.on_event("startup")
+async def _launch_autonomous_loop():
+    async def loop():
+        while True:
+            try:
+                if is_autonomous_enabled():
+                    # run_market_hours_trading() does real network I/O
+                    # (Alpaca, Postgres) — keep it off the event loop.
+                    await asyncio.to_thread(run_market_hours_trading)
+            except Exception as exc:
+                print(f"[autonomous] trading cycle failed: {exc}")
+            await asyncio.sleep(AUTONOMOUS_LOOP_INTERVAL_SECONDS)
+
+    asyncio.create_task(loop())
+
+
+# How often the weekly-discovery loop wakes up to check whether it's due
+# (Friday, after market close, not already run this week). Coarser than
+# the trading loop's interval on purpose — this only needs to notice
+# "it's now past 4pm ET on a Friday" sometime before end of day, not
+# within seconds of it.
+DISCOVERY_CHECK_INTERVAL_SECONDS = 1800
+DISCOVERY_DAY_OF_WEEK = 4  # Monday=0 ... Friday=4
+DISCOVERY_HOUR_ET = 16  # 4pm
+
+
+def _discovery_already_ran_today(db) -> bool:
+    today = date.today()
+    return db.query(DiscoveryRunLog).filter(DiscoveryRunLog.run_date == today).first() is not None
+
+
+def _discovery_is_due() -> bool:
+    now_et = dt.datetime.now(ZoneInfo("America/New_York"))
+    if now_et.weekday() != DISCOVERY_DAY_OF_WEEK or now_et.hour < DISCOVERY_HOUR_ET:
+        return False
+    db = SessionLocal()
+    try:
+        return not _discovery_already_ran_today(db)
+    finally:
+        db.close()
+
+
+@app.on_event("startup")
+async def _launch_discovery_loop():
+    async def loop():
+        while True:
+            try:
+                if _discovery_is_due():
+                    added = await asyncio.to_thread(run_weekly_stock_discovery)
+                    print(f"[discovery] weekly run added: {[a['ticker'] for a in added]}")
+            except Exception as exc:
+                print(f"[discovery] weekly run failed: {exc}")
+            await asyncio.sleep(DISCOVERY_CHECK_INTERVAL_SECONDS)
+
+    asyncio.create_task(loop())
+
+
+# How often the swing-strategy autonomous loop checks in — deliberately
+# tighter than the live loop's 5-minute cadence isn't needed here either;
+# same interval, same reasoning (run_swing_paper_cycle is cheap for
+# variant A/C — no LLM calls — and this only controls how promptly a
+# newly-confirmed setup gets acted on while the toggle is on).
+SWING_AUTONOMOUS_INTERVAL_SECONDS = 300
+
+
+@app.on_event("startup")
+async def _launch_swing_autonomous_loop():
+    async def loop():
+        while True:
+            try:
+                if is_swing_autonomous_enabled() and is_market_hours():
+                    variant = get_swing_autonomous_variant(default="A")
+                    config = SwingStrategyConfig(gate_variant=GateVariant(variant))
+                    # execute=True: places real Alpaca PAPER orders into the
+                    # isolated swing_positions/swing_trades tables — never
+                    # the live Position/Trade tables, never real money (see
+                    # engine/swing_strategy/README.md and
+                    # tests/test_swing_preserves_live_behavior.py for the
+                    # isolation guarantees this relies on).
+                    summary = await asyncio.to_thread(run_swing_paper_cycle, config, True)
+                    if summary["accepted"] or summary["exits"]:
+                        print(f"[swing-autonomous] variant {variant}: accepted={summary['accepted']} exits={summary['exits']}")
+            except Exception as exc:
+                print(f"[swing-autonomous] cycle failed: {exc}")
+            await asyncio.sleep(SWING_AUTONOMOUS_INTERVAL_SECONDS)
+
+    asyncio.create_task(loop())
 
 # The dashboard is a separate Electron/Vite process on its own origin
 # (localhost:5173 in dev, an opaque "null" origin once packaged and
@@ -185,6 +299,282 @@ def get_trades_summary():
 @app.get("/watchlist", dependencies=[Depends(require_token)])
 def get_watchlist():
     return {"watchlist": WATCHLIST}
+
+
+class TradeRequest(BaseModel):
+    qty: float | None = None  # override the default sizing/full-position qty
+
+
+@app.post("/positions/{ticker}/buy", dependencies=[Depends(require_token)])
+def buy_position(ticker: str, body: TradeRequest = TradeRequest()):
+    """Manual buy from the dashboard — bypasses evaluate_entry entirely,
+    same as every manual trade so far in this project. Sized by the bot's
+    own 10%-equity rule unless the caller overrides qty."""
+    ticker = ticker.upper()
+    if body.qty is not None:
+        qty = body.qty
+    else:
+        account_equity = float(get_broker_account().equity)
+        try:
+            price = float(fetch_ohlcv(ticker, outputsize=1)["close"].iloc[-1])
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Could not price {ticker}: {exc}")
+        qty = round((account_equity * MAX_POSITION_PCT) / price, 4)
+
+    db = SessionLocal()
+    try:
+        try:
+            return execute_buy(db, ticker, qty, reason="manual")
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+    finally:
+        db.close()
+
+
+@app.post("/positions/{ticker}/sell", dependencies=[Depends(require_token)])
+def sell_position(ticker: str, body: TradeRequest = TradeRequest()):
+    """Manual sell — closes the full position unless qty is overridden."""
+    ticker = ticker.upper()
+    held = {p.symbol: p for p in get_broker_positions()}.get(ticker)
+    if held is None:
+        raise HTTPException(status_code=404, detail=f"No open {ticker} position.")
+    qty = body.qty if body.qty is not None else float(held.qty)
+
+    db = SessionLocal()
+    try:
+        try:
+            return execute_sell(db, ticker, qty, reason="manual")
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+    finally:
+        db.close()
+
+
+@app.get("/autonomous", dependencies=[Depends(require_token)])
+def autonomous_status():
+    db = SessionLocal()
+    try:
+        latest = db.query(AutonomousModeLog).order_by(AutonomousModeLog.id.desc()).first()
+    finally:
+        db.close()
+    return {
+        "autonomous_enabled": is_autonomous_enabled(),
+        "reason": latest.reason if latest else None,
+        "timestamp": latest.timestamp.isoformat() if latest else None,
+    }
+
+
+@app.post("/autonomous/enable", dependencies=[Depends(require_token)])
+def enable_autonomous():
+    """Turns on unattended trading: every AUTONOMOUS_LOOP_INTERVAL_SECONDS
+    while this backend process is running, market hours are open, and the
+    kill switch is on, it runs the same evaluate_entry/evaluate_exit cycle
+    functions/market_hours_trading.py always ran — just without a human
+    triggering it. Does not touch the kill switch itself."""
+    set_autonomous_enabled(True, reason="manual enable")
+    return {"autonomous_enabled": True}
+
+
+@app.post("/autonomous/disable", dependencies=[Depends(require_token)])
+def disable_autonomous():
+    set_autonomous_enabled(False, reason="manual disable")
+    return {"autonomous_enabled": False}
+
+
+class SwingAutonomousEnableRequest(BaseModel):
+    variant: str = "A"  # "A" | "B" | "C" | "D" — see engine.swing_strategy.config.GateVariant
+
+
+@app.get("/swing/autonomous", dependencies=[Depends(require_token)])
+def swing_autonomous_status():
+    return {
+        "swing_autonomous_enabled": is_swing_autonomous_enabled(),
+        "variant": get_swing_autonomous_variant(),
+    }
+
+
+@app.post("/swing/autonomous/enable", dependencies=[Depends(require_token)])
+def enable_swing_autonomous(body: SwingAutonomousEnableRequest = SwingAutonomousEnableRequest()):
+    """Turns on unattended PAPER trading for the experimental swing
+    strategy — separate from /autonomous/enable (the live strategy's
+    switch). Places real Alpaca paper orders into swing_positions/
+    swing_trades only; never touches the live Position/Trade tables or
+    real money."""
+    if body.variant not in ("A", "B", "C", "D"):
+        raise HTTPException(status_code=400, detail="variant must be one of A, B, C, D")
+    set_swing_autonomous_enabled(True, variant=body.variant, reason="manual enable")
+    return {"swing_autonomous_enabled": True, "variant": body.variant}
+
+
+@app.post("/swing/autonomous/disable", dependencies=[Depends(require_token)])
+def disable_swing_autonomous():
+    set_swing_autonomous_enabled(False, variant=get_swing_autonomous_variant(), reason="manual disable")
+    return {"swing_autonomous_enabled": False}
+
+
+@app.get("/swing/positions", dependencies=[Depends(require_token)])
+def get_swing_positions():
+    db = SessionLocal()
+    try:
+        positions = db.query(SwingPosition).filter(SwingPosition.status == "open").order_by(SwingPosition.entry_timestamp.desc()).all()
+        return {
+            "positions": [
+                {
+                    "ticker": p.ticker, "quantity": p.quantity, "entry_price": p.entry_price,
+                    "stop_price": p.stop_price, "target_price": p.target_price,
+                    "entry_timestamp": p.entry_timestamp.isoformat(), "strategy_version": p.strategy_version,
+                }
+                for p in positions
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.get("/swing/candidates", dependencies=[Depends(require_token)])
+def get_swing_candidates(limit: int = 50):
+    db = SessionLocal()
+    try:
+        candidates = db.query(SwingCandidateLog).order_by(SwingCandidateLog.id.desc()).limit(limit).all()
+        return {
+            "candidates": [
+                {
+                    "ticker": c.ticker, "variant": c.variant, "accepted": c.accepted,
+                    "rejection_reason": c.rejection_reason, "entry_price": c.entry_price,
+                    "stop_price": c.stop_price, "target_price": c.target_price,
+                    "reward_to_risk": c.reward_to_risk, "shares": c.shares,
+                    "planned_dollar_risk": c.planned_dollar_risk,
+                    "signal_timestamp": c.signal_timestamp.isoformat() if c.signal_timestamp else None,
+                }
+                for c in candidates
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.get("/swing/trades", dependencies=[Depends(require_token)])
+def get_swing_trades(limit: int = 100):
+    db = SessionLocal()
+    try:
+        trades = db.query(SwingTrade).order_by(SwingTrade.timestamp.desc()).limit(limit).all()
+        return {
+            "trades": [
+                {"ticker": t.ticker, "action": t.action, "quantity": t.quantity, "price": t.price,
+                 "reason": t.reason, "timestamp": t.timestamp.isoformat()}
+                for t in trades
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.get("/discovery", dependencies=[Depends(require_token)])
+def discovery_status():
+    """Latest weekly-discovery run, plus whether one is scheduled to fire
+    later today (Friday after 4pm ET) — see the startup loop above."""
+    db = SessionLocal()
+    try:
+        latest = db.query(DiscoveryRunLog).order_by(DiscoveryRunLog.id.desc()).first()
+    finally:
+        db.close()
+    now_et = dt.datetime.now(ZoneInfo("America/New_York"))
+    return {
+        "last_run_date": latest.run_date.isoformat() if latest else None,
+        "last_run_tickers": latest.tickers.split(", ") if latest and latest.tickers else [],
+        "due_today": _discovery_is_due(),
+        "current_time_et": now_et.isoformat(),
+    }
+
+
+@app.post("/discovery/run-now", dependencies=[Depends(require_token)])
+def discovery_run_now():
+    """Manual trigger — runs discovery immediately regardless of day/time,
+    for testing or if you don't want to wait for Friday. Still records a
+    DiscoveryRunLog row, so it counts as this week's run."""
+    added = run_weekly_stock_discovery()
+    return {"added": added}
+
+
+@app.get("/recommendations", dependencies=[Depends(require_token)])
+def get_recommendations():
+    """Candidates not currently held — the bot's own WATCHLIST plus the
+    user's personal Watcher list — scored against the same gates
+    evaluate_entry uses, from whatever research is already cached. Never
+    triggers new research itself (the Watcher list's whole point is that
+    adding a ticker doesn't kick off research/trading on its own)."""
+    db = SessionLocal()
+    try:
+        held_tickers = {p.symbol for p in get_broker_positions()}
+        watched_tickers = [w.ticker for w in db.query(WatchedTicker).all()]
+        candidates = sorted((set(watched_tickers) | set(WATCHLIST)) - held_tickers)
+
+        def latest_note(ticker, module):
+            return (
+                db.query(ResearchNote)
+                .filter(ResearchNote.ticker == ticker, ResearchNote.module == module)
+                .order_by(ResearchNote.created_at.desc())
+                .first()
+            )
+
+        results = []
+        for ticker in candidates:
+            technical_note = latest_note(ticker, "technical_scan")
+            dcf_note = latest_note(ticker, "dcf")
+            technical = json.loads(technical_note.structured_output) if technical_note and technical_note.structured_output else None
+            dcf = json.loads(dcf_note.structured_output) if dcf_note and dcf_note.structured_output else None
+            sentiment_items = db.query(NewsItem).filter(NewsItem.ticker == ticker).order_by(NewsItem.ingested_at.desc()).limit(20).all()
+            scores = [n.sentiment_score for n in sentiment_items if n.sentiment_score is not None]
+            avg_sentiment = sum(scores) / len(scores) if scores else 0.0
+
+            clears = False
+            discount_pct = None
+            if dcf is None:
+                reason = "No DCF yet — valuation unknown"
+            elif dcf.get("share_count_source") != "filing":
+                # Fail closed: covers an explicit "unavailable" AND every
+                # DCF cached before this field existed (see the matching
+                # guard in engine.entry_exit.signals.evaluate_entry).
+                reason = "DCF unreliable — filed share count unavailable"
+            elif technical is None:
+                reason = "No technical scan yet"
+            elif technical.get("trend") == "down":
+                reason = "Downtrend"
+            elif avg_sentiment < 0:
+                reason = f"Negative recent sentiment ({avg_sentiment:.2f})"
+            else:
+                fair_value = dcf.get("estimated_fair_value_per_share")
+                entry_price = technical.get("entry_price")
+                if not fair_value or not entry_price:
+                    reason = "Incomplete research data"
+                else:
+                    discount_pct = (fair_value - entry_price) / entry_price * 100
+                    if discount_pct < 20:
+                        reason = f"Only {discount_pct:.0f}% below fair value (needs 20%+)"
+                    else:
+                        clears = True
+                        reason = f"{discount_pct:.0f}% below fair value, uptrend"
+
+            try:
+                company_name = get_company_name(ticker)
+            except Exception:
+                company_name = None
+
+            results.append({
+                "ticker": ticker,
+                "company_name": company_name,
+                "clears_entry_gate": clears,
+                "discount_pct": discount_pct,
+                "reason": reason,
+                "on_watchlist": ticker in WATCHLIST,
+                "on_watcher": ticker in watched_tickers,
+                "researched_at": technical_note.created_at.isoformat() if technical_note else None,
+            })
+
+        results.sort(key=lambda r: (not r["clears_entry_gate"], -(r["discount_pct"] if r["discount_pct"] is not None else -999)))
+        return {"recommendations": results}
+    finally:
+        db.close()
 
 
 class WatchedTickerCreate(BaseModel):
