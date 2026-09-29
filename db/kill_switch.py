@@ -7,7 +7,7 @@ flag in one process is invisible to the other.
 """
 
 from .session import SessionLocal
-from .models import KillSwitchLog
+from .models import KillSwitchLog, NotificationOutbox
 
 
 def is_bot_enabled() -> bool:
@@ -23,6 +23,8 @@ def set_bot_enabled(enabled: bool, reason: str) -> None:
     db = SessionLocal()
     try:
         db.add(KillSwitchLog(enabled=enabled, reason=reason))
+        if not enabled:
+            db.add(NotificationOutbox(body=f"Trading Bot ALERT: new entries paused ({reason}). Position protection continues."))
         db.commit()
     finally:
         db.close()

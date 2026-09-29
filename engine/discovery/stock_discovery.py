@@ -13,9 +13,8 @@ re-verified against SEC/exchange data. What IS real and live: market cap
 bars), which drive the small-cap / low-vol / high-vol picks and get
 recorded in each ticker's note so the pick is checkable, not asserted.
 
-Nothing here triggers a DCF/deep-dive/technical-scan research cycle —
-being added to the Watcher list has never meant that (see WatchedTicker's
-own docstring), and this keeps that invariant.
+Discovery adds candidates to the Watcher. The separate research worker then
+picks up missing/stale reports in bounded batches; discovery never trades.
 """
 
 import math
@@ -24,6 +23,7 @@ from datetime import date, datetime, timezone
 
 from db.session import SessionLocal
 from db.models import DiscoveryRunLog, Position, WatchedTicker
+from db.watcher_retention import AUTO_DISCOVERY_PREFIX, expire_watched
 from broker.alpaca_client import get_positions
 from engine.price_action_engine.market_data import fetch_ohlcv
 from engine.valuation_engine.fundamentals_data import get_market_data, get_company_name
@@ -52,7 +52,11 @@ OHLCV_CALL_PACING_SECONDS = 2.0
 def _already_tracked(db) -> set[str]:
     held = {p.symbol for p in get_positions()}
     watched = {w.ticker for w in db.query(WatchedTicker).all()}
-    return held | watched | set(WATCHLIST)
+    # Avoid immediately selecting the same batch that just aged out. Keep
+    # the two most recent discovery batches excluded even after cleanup.
+    recent_runs = db.query(DiscoveryRunLog).order_by(DiscoveryRunLog.id.desc()).limit(2).all()
+    recent = {ticker.strip() for run in recent_runs for ticker in (run.tickers or "").split(",") if ticker.strip()}
+    return held | watched | recent | set(WATCHLIST)
 
 
 def _annualized_volatility(ticker: str) -> float | None:
@@ -86,6 +90,7 @@ def _market_cap_note(ticker: str) -> str:
 def run_weekly_discovery() -> list[dict]:
     db = SessionLocal()
     try:
+        expire_watched(db)
         excluded = _already_tracked(db)
         picks: list[dict] = []  # {ticker, category, note}
         picked_tickers: set[str] = set()
@@ -146,7 +151,7 @@ def run_weekly_discovery() -> list[dict]:
             except Exception:
                 company_name = None
             vol_note = f", 20d volatility {p['vol'] * 100:.0f}% (annualized)" if p["vol"] is not None else ""
-            note = f"Auto-discovered {date.today().isoformat()} — {p['category']}; {_market_cap_note(ticker)}{vol_note}"
+            note = f"{AUTO_DISCOVERY_PREFIX}{date.today().isoformat()} — {p['category']}; {_market_cap_note(ticker)}{vol_note}"
 
             if db.query(WatchedTicker).filter(WatchedTicker.ticker == ticker).first():
                 continue  # picked twice across runs due to a race — skip rather than error

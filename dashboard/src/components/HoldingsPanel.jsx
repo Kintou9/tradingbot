@@ -218,7 +218,7 @@ export default function HoldingsPanel() {
   const toggleExpanded = (t) => setExpanded((current) => (current === t ? null : t));
 
   const handleSell = async (p) => {
-    if (!window.confirm(`Sell all ${p.qty} shares of ${p.ticker} at market (paper)?`)) return;
+    if (!window.confirm(`Request a sale of ${p.qty} shares of ${p.ticker}? Existing protective orders must be canceled first; completion may require a retry after cancellation is confirmed.`)) return;
     setSelling(p.ticker);
     setActionError(null);
     try {

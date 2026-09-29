@@ -21,6 +21,7 @@ import traceback
 
 from dotenv import load_dotenv
 from twilio.rest import Client
+from twilio.http.http_client import TwilioHttpClient
 
 load_dotenv()
 
@@ -30,16 +31,22 @@ TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
 TWILIO_TO_NUMBER = os.getenv("TWILIO_TO_NUMBER")
 
 
-def send_sms(body: str) -> None:
+def is_configured() -> bool:
+    return all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, TWILIO_TO_NUMBER])
+
+
+def send_sms(body: str) -> bool:
     if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, TWILIO_TO_NUMBER]):
         print(f"[notifications] Twilio not configured, skipping SMS: {body}")
-        return
+        return False
 
     try:
-        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, http_client=TwilioHttpClient(timeout=5))
         client.messages.create(body=body, from_=TWILIO_FROM_NUMBER, to=TWILIO_TO_NUMBER)
+        return True
     except Exception as exc:
         print(f"[notifications] Failed to send SMS: {exc}")
+        return False
 
 
 def notify_trade(ticker: str, action: str, quantity: float, price: float, reason: str) -> None:
@@ -47,7 +54,7 @@ def notify_trade(ticker: str, action: str, quantity: float, price: float, reason
 
 
 def notify_kill_switch_engaged(reason: str) -> None:
-    send_sms(f"Trading Bot ALERT: kill switch auto-engaged ({reason}). Trading halted.")
+    send_sms(f"Trading Bot ALERT: entries paused ({reason}). Position protection continues.")
 
 
 def notify_error(context: str, exc: Exception) -> None:

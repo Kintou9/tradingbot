@@ -32,7 +32,7 @@ export default function RecommendationsPanel() {
   }, []);
 
   const handleBuy = async (r) => {
-    if (!window.confirm(`Buy ${r.ticker} at market, sized to 10% of equity (paper)?`)) return;
+    if (!window.confirm(`Submit a protected buy for ${r.ticker} within the server’s trade and exposure limits?`)) return;
     setBuying(r.ticker);
     setActionError(null);
     try {

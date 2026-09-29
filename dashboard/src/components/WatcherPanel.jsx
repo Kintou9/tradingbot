@@ -14,12 +14,33 @@ function fmtDateTime(iso) {
   });
 }
 
+const researchLabels = {
+  queued: "Queued for research",
+  running: "Researching…",
+  current: "Up to date",
+  stale: "Update queued",
+  partial: "Partially updated",
+  failed: "Research failed",
+  paused: "Research paused",
+};
+
 function WatcherDetail({ watched }) {
   const deepDive = watched.deep_dive?.structured;
   const technical = watched.technical?.structured;
 
   return (
     <div className="research-cards watcher-detail">
+      <div className="research-card">
+        <h4>Research update</h4>
+        <div>{researchLabels[watched.research?.status] || "Awaiting status"}</div>
+        {watched.research?.assessment_updated_at && (
+          <div>Last assessment: {fmtDateTime(watched.research.assessment_updated_at)}</div>
+        )}
+        {watched.research?.assessment_stale && <p className="text-critical">This assessment is more than 24 hours old.</p>}
+        {watched.research?.errors?.map((error) => <div className="text-critical" key={error}>{error}</div>)}
+        {watched.research?.retry_at && <div>Next retry after {fmtDateTime(watched.research.retry_at)}</div>}
+        <p className="text-muted">Buy, hold, avoid and short are analyst assessments. They do not place an order or automatically sell a holding.</p>
+      </div>
       <div className="research-card">
         <h4>Deep Dive</h4>
         {deepDive ? (
@@ -52,6 +73,12 @@ function WatcherDetail({ watched }) {
               </>
             )}
             <div className="text-muted watcher-detail-date">Researched {fmtDateTime(watched.deep_dive.created_at)}</div>
+            {watched.deep_dive.report && (
+              <details>
+                <summary>Full analyst report</summary>
+                <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{watched.deep_dive.report}</div>
+              </details>
+            )}
           </>
         ) : (
           <div className="text-muted">No deep-dive research yet.</div>
@@ -98,7 +125,11 @@ function DiscoveryBanner({ onDiscovered }) {
     api.discoveryStatus().then(setStatus).catch(() => {});
   };
 
-  useEffect(refresh, []);
+  useEffect(() => {
+    refresh();
+    const timer = setInterval(refresh, 60000);
+    return () => clearInterval(timer);
+  }, []);
 
   const handleRunNow = async () => {
     if (
@@ -162,7 +193,11 @@ export default function WatcherPanel() {
       .catch((e) => setError(e.message));
   };
 
-  useEffect(refresh, []);
+  useEffect(() => {
+    refresh();
+    const timer = setInterval(refresh, 60000);
+    return () => clearInterval(timer);
+  }, []);
 
   const handleAdd = async (e) => {
     e.preventDefault();
@@ -197,6 +232,10 @@ export default function WatcherPanel() {
   return (
     <div className="overview">
       <DiscoveryBanner onDiscovered={refresh} />
+      <div className="text-muted">
+        Discovered stocks leave the Watcher after 14 days, oldest first. Manually added stocks stay until you remove them.
+      </div>
+      <div className="text-muted">Research checks every five minutes while the backend is running, processes two stocks at a time, and refreshes assessments after 24 hours. Expand a stock for its report and any update errors.</div>
       <form className="watcher-form" onSubmit={handleAdd}>
         <input
           className="watcher-input"
@@ -230,7 +269,9 @@ export default function WatcherPanel() {
               <th>Company</th>
               <th>Notes</th>
               <th>Added</th>
+              <th>Auto-removes</th>
               <th>Latest Verdict</th>
+              <th>Research Update</th>
               <th>Latest Trend</th>
               <th></th>
             </tr>
@@ -251,12 +292,17 @@ export default function WatcherPanel() {
                     <td>{w.company_name || <span className="text-muted">—</span>}</td>
                     <td className="text-muted">{w.notes || "—"}</td>
                     <td className="text-muted">{fmtDate(w.added_at)}</td>
+                    <td className="text-muted">{w.expires_at ? fmtDateTime(w.expires_at) : "Manual removal"}</td>
                     <td>
                       {w.latest_verdict ? (
-                        <span className={`verdict-pill verdict-${w.latest_verdict}`}>{w.latest_verdict}</span>
+                        <span className={`verdict-pill verdict-${w.latest_verdict}`}>{w.latest_verdict}{w.research?.assessment_stale ? " (outdated)" : ""}</span>
                       ) : (
                         <span className="text-muted">No research yet</span>
                       )}
+                    </td>
+                    <td className="text-muted">
+                      <div>{researchLabels[w.research?.status] || "Awaiting status"}</div>
+                      {w.research?.assessment_updated_at && <div>{fmtDateTime(w.research.assessment_updated_at)}</div>}
                     </td>
                     <td>
                       {w.latest_trend ? (
@@ -279,7 +325,7 @@ export default function WatcherPanel() {
                   </tr>
                   {isExpanded && (
                     <tr className="watcher-detail-row">
-                      <td colSpan={7}>
+                      <td colSpan={9}>
                         <WatcherDetail watched={w} />
                       </td>
                     </tr>

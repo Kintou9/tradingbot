@@ -37,6 +37,8 @@ export default function StatusBar() {
         await api.resume();
       }
       refresh();
+    } catch (err) {
+      setError(err.message);
     } finally {
       setBusy(false);
     }
@@ -45,9 +47,9 @@ export default function StatusBar() {
   const toggleAutonomous = async () => {
     if (!autonomous) {
       const confirmed = window.confirm(
-        "Turn on autonomous trading?\n\nWhile this is on and the dashboard app is running, the bot will " +
-          "place and close paper trades on its own — no click needed — whenever a ticker on the watchlist " +
-          "clears the entry/exit rules. The kill switch still applies. Turning this off again always stops it."
+        "Enable autonomous entries?\n\nThe backend will place protected orders within the configured limits. " +
+          "Turning this off or pausing entries keeps existing-position protection running. " +
+          "The backend must stay running for monitoring and reconciliation."
       );
       if (!confirmed) return;
     }
@@ -59,6 +61,8 @@ export default function StatusBar() {
         await api.enableAutonomous();
       }
       refresh();
+    } catch (err) {
+      setError(err.message);
     } finally {
       setAutonomousBusy(false);
     }
@@ -78,7 +82,7 @@ export default function StatusBar() {
   return (
     <div className="status-bar">
       <span className={`status-dot ${enabled ? "status-dot-good" : "status-dot-critical"}`} />
-      <span className="status-label">{enabled ? "Bot active" : "Trading halted"}</span>
+      <span className="status-label">{enabled ? "Entries allowed" : "Entries paused — protection continues"}</span>
       {!enabled && status?.kill_switch_reason && (
         <span className="status-reason text-muted">({status.kill_switch_reason})</span>
       )}
@@ -87,9 +91,15 @@ export default function StatusBar() {
         onClick={toggle}
         disabled={busy || status === null}
       >
-        {enabled ? "Kill Switch" : "Resume Trading"}
+        {enabled ? "Pause Entries" : "Resume Entries"}
       </button>
 
+      <span className="status-label">{status?.trading_mode?.toUpperCase()}</span>
+      {status?.monitoring?.issues?.length > 0 && (
+        <span className="text-critical" title={status.monitoring.issues.join("\n")}>
+          Needs attention: {status.monitoring.issues[0]}
+        </span>
+      )}
       <span className={`status-dot ${autonomous ? "status-dot-good" : "status-dot-critical"}`} />
       <span className="status-label">{autonomous ? "Autonomous mode ON" : "Autonomous mode off"}</span>
       <button

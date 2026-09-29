@@ -4,16 +4,14 @@ FastAPI app entrypoint.
 Run locally with:
     uvicorn api.main:app --reload
 
-Endpoints here are for the dashboard (positions, trade history, P&L)
-and the manual kill switch. Actual trading logic lives in /engine
-and gets invoked by the Azure Functions in /functions, not by this
-API directly (the API is for observing/controlling the bot, not
-running the trading loop itself).
+The API owns the background protection/reconciliation and research workers,
+alongside authenticated dashboard controls. Strategy and execution logic
+live in /functions and /engine.
 """
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from datetime import date
 from zoneinfo import ZoneInfo
@@ -23,7 +21,7 @@ import json
 import os
 import secrets
 
-from broker.alpaca_client import get_account as get_broker_account, get_positions as get_broker_positions
+from broker.alpaca_client import get_account as get_broker_account, get_positions as get_broker_positions, PAPER, assert_trading_mode
 from db.analytics import compute_trade_summary
 from db.session import SessionLocal, init_db
 from db.models import (
@@ -31,9 +29,15 @@ from db.models import (
     SwingCandidateLog, SwingPosition, SwingTrade,
 )
 from db.kill_switch import is_bot_enabled, set_bot_enabled
+from db.watcher_retention import expire_watched, expires_at, run_watcher_cleanup
+from db.research_status import research_state
 from db.autonomous_mode import is_autonomous_enabled, set_autonomous_enabled
 from db.swing_autonomous_mode import is_swing_autonomous_enabled, get_swing_autonomous_variant, set_swing_autonomous_enabled
 from engine.entry_exit.execution import execute_buy, execute_sell
+from engine.entry_exit.risk import Limits, RiskRejected
+from db.execution_lock import ExecutionBusy
+from notifications.monitoring import health_state, supervisor_tick
+from fastapi.responses import JSONResponse
 from engine.price_action_engine.market_data import fetch_ohlcv
 from engine.valuation_engine.fundamentals_data import get_company_name
 from engine.swing_strategy.config import SwingStrategyConfig, GateVariant
@@ -41,6 +45,7 @@ from functions.after_hours_research import WATCHLIST
 from functions.market_hours_trading import MAX_POSITION_PCT, is_market_hours, run_market_hours_trading
 from functions.swing_paper_trading import run_swing_paper_cycle
 from functions.weekly_discovery import run_weekly_stock_discovery
+from functions.scheduled_research import run_scheduled_research
 
 load_dotenv()
 
@@ -50,13 +55,11 @@ DASHBOARD_API_TOKEN = os.getenv("DASHBOARD_API_TOKEN")
 # only needs to *display* the limit, not enforce it, so it reads the same
 # env var rather than importing that module (which stands up its own
 # broker/trading-loop wiring at import time).
-DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.10"))
+DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.02"))
 
-# How often the autonomous loop re-checks whether it should run a trading
-# cycle. run_market_hours_trading() is itself a no-op outside market hours
-# or while the kill switch is off, so this just controls how promptly a
-# newly-eligible signal gets acted on while autonomous mode is on.
-AUTONOMOUS_LOOP_INTERVAL_SECONDS = 300
+# Protection/reconciliation runs independently of entry switches. The
+# strategy's persisted entry cadence remains five minutes.
+AUTONOMOUS_LOOP_INTERVAL_SECONDS = 30  # protection cadence; entries remain every 300s
 
 app = FastAPI(title="Trading Bot API")
 
@@ -71,14 +74,37 @@ async def _launch_autonomous_loop():
     async def loop():
         while True:
             try:
-                if is_autonomous_enabled():
-                    # run_market_hours_trading() does real network I/O
-                    # (Alpaca, Postgres) — keep it off the event loop.
-                    await asyncio.to_thread(run_market_hours_trading)
+                # Always reconcile and protect existing holdings, even when
+                # autonomous entries or the entry kill switch are disabled.
+                await asyncio.to_thread(supervisor_tick, run_market_hours_trading)
             except Exception as exc:
                 print(f"[autonomous] trading cycle failed: {exc}")
             await asyncio.sleep(AUTONOMOUS_LOOP_INTERVAL_SECONDS)
 
+    asyncio.create_task(loop())
+
+
+@app.on_event("startup")
+async def _launch_research_loop():
+    async def loop():
+        while True:
+            try:
+                await asyncio.to_thread(run_scheduled_research)
+            except Exception as exc:
+                print(f"[research] scheduled run failed: {type(exc).__name__}")
+            await asyncio.sleep(300)
+    asyncio.create_task(loop())
+
+
+@app.on_event("startup")
+async def _launch_watcher_cleanup():
+    async def loop():
+        while True:
+            try:
+                await asyncio.to_thread(run_watcher_cleanup)
+            except Exception as exc:
+                print(f"[watcher] cleanup failed: {type(exc).__name__}")
+            await asyncio.sleep(60)
     asyncio.create_task(loop())
 
 
@@ -185,7 +211,21 @@ def require_token(x_api_token: str | None = Header(default=None)):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "trading_mode": os.getenv("TRADING_MODE", "paper")}
+    return {"status": "ok", "trading_mode": "paper" if PAPER else "live"}
+
+
+@app.get("/health/ready")
+def readiness():
+    db = SessionLocal()
+    try:
+        state = health_state(db)
+        # Public monitor gets only aggregate health, no account details.
+        return JSONResponse(status_code=200 if state["healthy"] else 503,
+                            content={"healthy": state["healthy"]})
+    except Exception:
+        return JSONResponse(status_code=503, content={"healthy": False})
+    finally:
+        db.close()
 
 
 @app.get("/status", dependencies=[Depends(require_token)])
@@ -193,10 +233,14 @@ def status():
     db = SessionLocal()
     try:
         latest_log = db.query(KillSwitchLog).order_by(KillSwitchLog.id.desc()).first()
+        monitoring = health_state(db)
     finally:
         db.close()
     return {
         "bot_enabled": is_bot_enabled(),
+        "trading_mode": "paper" if PAPER else "live",
+        "monitoring": monitoring,
+        "limits": vars(Limits.from_env()),
         "kill_switch_reason": latest_log.reason if latest_log else None,
         "kill_switch_timestamp": latest_log.timestamp.isoformat() if latest_log else None,
     }
@@ -226,7 +270,7 @@ def kill_switch():
     """Manual kill switch — halts the bot from taking new trades.
     Wire this up to a button on your dashboard."""
     set_bot_enabled(False, reason="manual kill switch")
-    return {"bot_enabled": False, "message": "Trading halted."}
+    return {"bot_enabled": False, "message": "New entries paused. Existing-position protection continues."}
 
 
 @app.post("/resume", dependencies=[Depends(require_token)])
@@ -302,31 +346,26 @@ def get_watchlist():
 
 
 class TradeRequest(BaseModel):
-    qty: float | None = None  # override the default sizing/full-position qty
+    qty: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    stop_loss_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    take_profit_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
 @app.post("/positions/{ticker}/buy", dependencies=[Depends(require_token)])
 def buy_position(ticker: str, body: TradeRequest = TradeRequest()):
-    """Manual buy from the dashboard — bypasses evaluate_entry entirely,
-    same as every manual trade so far in this project. Sized by the bot's
-    own 10%-equity rule unless the caller overrides qty."""
+    """Manual entries use exactly the same broker protection and risk limits."""
     ticker = ticker.upper()
-    if body.qty is not None:
-        qty = body.qty
-    else:
-        account_equity = float(get_broker_account().equity)
-        try:
-            price = float(fetch_ohlcv(ticker, outputsize=1)["close"].iloc[-1])
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Could not price {ticker}: {exc}")
-        qty = round((account_equity * MAX_POSITION_PCT) / price, 4)
-
     db = SessionLocal()
     try:
-        try:
-            return execute_buy(db, ticker, qty, reason="manual")
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
+        from functions.market_hours_trading import _latest_research
+        research = _latest_research(db, ticker, "technical_scan") or {}
+        return execute_buy(db, ticker, body.qty, reason="manual",
+            stop_loss_price=body.stop_loss_price or research.get("stop_loss"),
+            take_profit_price=body.take_profit_price or research.get("target_1"))
+    except (RiskRejected, ExecutionBusy) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
     finally:
         db.close()
 
@@ -344,6 +383,8 @@ def sell_position(ticker: str, body: TradeRequest = TradeRequest()):
     try:
         try:
             return execute_sell(db, ticker, qty, reason="manual")
+        except (RiskRejected, ExecutionBusy) as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc))
     finally:
@@ -366,11 +407,13 @@ def autonomous_status():
 
 @app.post("/autonomous/enable", dependencies=[Depends(require_token)])
 def enable_autonomous():
-    """Turns on unattended trading: every AUTONOMOUS_LOOP_INTERVAL_SECONDS
-    while this backend process is running, market hours are open, and the
-    kill switch is on, it runs the same evaluate_entry/evaluate_exit cycle
-    functions/market_hours_trading.py always ran — just without a human
-    triggering it. Does not touch the kill switch itself."""
+    """Enable unattended entries, subject to shared risk and monitoring gates.
+    Existing-position protection runs independently of this switch."""
+    try:
+        assert_trading_mode()
+        Limits.from_env()
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     set_autonomous_enabled(True, reason="manual enable")
     return {"autonomous_enabled": True}
 
@@ -402,6 +445,8 @@ def enable_swing_autonomous(body: SwingAutonomousEnableRequest = SwingAutonomous
     real money."""
     if body.variant not in ("A", "B", "C", "D"):
         raise HTTPException(status_code=400, detail="variant must be one of A, B, C, D")
+    if not PAPER:
+        raise HTTPException(status_code=409, detail="Swing execution is paper-only")
     set_swing_autonomous_enabled(True, variant=body.variant, reason="manual enable")
     return {"swing_autonomous_enabled": True, "variant": body.variant}
 
@@ -501,10 +546,11 @@ def get_recommendations():
     """Candidates not currently held — the bot's own WATCHLIST plus the
     user's personal Watcher list — scored against the same gates
     evaluate_entry uses, from whatever research is already cached. Never
-    triggers new research itself (the Watcher list's whole point is that
-    adding a ticker doesn't kick off research/trading on its own)."""
+    triggers new research itself; the separate worker researches Watcher
+    candidates without authorizing trading."""
     db = SessionLocal()
     try:
+        expire_watched(db)
         held_tickers = {p.symbol for p in get_broker_positions()}
         watched_tickers = [w.ticker for w in db.query(WatchedTicker).all()]
         candidates = sorted((set(watched_tickers) | set(WATCHLIST)) - held_tickers)
@@ -584,12 +630,11 @@ class WatchedTickerCreate(BaseModel):
 
 @app.get("/watched", dependencies=[Depends(require_token)])
 def get_watched():
-    """Personal candidate list (db.models.WatchedTicker) — separate from
-    the bot's own WATCHLIST above. Includes the latest cached research
-    verdict/trend for a watched ticker if any already exists, purely as a
-    convenience; being on this list never triggers research or trading."""
+    """Watcher candidates, research freshness and latest assessments.
+    The research queue includes these candidates independently of trading."""
     db = SessionLocal()
     try:
+        expire_watched(db)
         watched = db.query(WatchedTicker).order_by(WatchedTicker.added_at.desc()).all()
         result = []
         for w in watched:
@@ -613,16 +658,19 @@ def get_watched():
                 "ticker": w.ticker,
                 "company_name": company_name,
                 "notes": w.notes,
-                "added_at": w.added_at.isoformat(),
+                "added_at": w.added_at.isoformat() + "Z",
+                "expires_at": expires_at(w).isoformat() + "Z" if expires_at(w) else None,
+                "research": research_state(db, w.ticker),
                 "latest_verdict": deep_dive.verdict if deep_dive else None,
                 "latest_trend": technical.verdict if technical else None,
                 "deep_dive": {
                     "structured": json.loads(deep_dive.structured_output) if deep_dive and deep_dive.structured_output else None,
-                    "created_at": deep_dive.created_at.isoformat(),
+                    "report": deep_dive.raw_output,
+                    "created_at": deep_dive.created_at.isoformat() + "Z",
                 } if deep_dive else None,
                 "technical": {
                     "structured": json.loads(technical.structured_output) if technical and technical.structured_output else None,
-                    "created_at": technical.created_at.isoformat(),
+                    "created_at": technical.created_at.isoformat() + "Z",
                 } if technical else None,
             })
         return {"watched": result}
@@ -637,6 +685,7 @@ def add_watched(body: WatchedTickerCreate):
         raise HTTPException(status_code=400, detail="Ticker is required.")
     db = SessionLocal()
     try:
+        expire_watched(db)
         existing = db.query(WatchedTicker).filter(WatchedTicker.ticker == ticker).first()
         if existing:
             raise HTTPException(status_code=409, detail=f"{ticker} is already on the watch list.")

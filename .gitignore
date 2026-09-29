@@ -5,6 +5,7 @@ __pycache__/
 .DS_Store
 *.db
 *.log
+*.execution.lock
 .pytest_cache/
 *.egg-info/
 

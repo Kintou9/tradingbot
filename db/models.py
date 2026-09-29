@@ -11,6 +11,51 @@ from datetime import datetime
 Base = declarative_base()
 
 
+class BrokerBinding(Base):
+    """Prevent reusing position tables with a different broker account/mode."""
+    __tablename__ = "broker_binding"
+    id = Column(Integer, primary_key=True)
+    account_key = Column(String, nullable=False)
+
+
+class ExecutionOrder(Base):
+    """Durable intent, written BEFORE submission; cumulative fills are applied once."""
+    __tablename__ = "execution_orders"
+    client_order_id = Column(String, primary_key=True)
+    broker_order_id = Column(String, unique=True, nullable=True)
+    parent_client_id = Column(String, nullable=True, index=True)
+    ticker = Column(String, nullable=False, index=True)
+    strategy = Column(String, nullable=False, default="primary")
+    side = Column(String, nullable=False)
+    role = Column(String, nullable=False)  # entry, exit, protection
+    qty = Column(Float, nullable=False)
+    limit_price = Column(Float, nullable=True)
+    stop_price = Column(Float, nullable=True)
+    target_price = Column(Float, nullable=True)
+    reason = Column(String, nullable=False)
+    metadata_json = Column(Text, nullable=True)
+    status = Column(String, nullable=False, default="submitting")
+    applied_qty = Column(Float, nullable=False, default=0)
+    applied_notional = Column(Float, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class RuntimeState(Base):
+    __tablename__ = "runtime_state"
+    key = Column(String, primary_key=True)
+    value = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class NotificationOutbox(Base):
+    __tablename__ = "notification_outbox"
+    id = Column(Integer, primary_key=True)
+    body = Column(Text, nullable=False)
+    sent_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class Trade(Base):
     __tablename__ = "trades"
 
@@ -51,6 +96,16 @@ class ResearchNote(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class ResearchStatus(Base):
+    """Latest research attempt per ticker, including partial/provider failures."""
+    __tablename__ = "research_status"
+    ticker = Column(String, primary_key=True)
+    status = Column(String, nullable=False)
+    started_at = Column(DateTime, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
+    errors_json = Column(Text, nullable=True)
+
+
 class NewsItem(Base):
     __tablename__ = "news_items"
 
@@ -67,7 +122,7 @@ class NewsItem(Base):
 class WatchedTicker(Base):
     """Personal candidate list — tickers the user is considering but hasn't
     added to the bot's own automated WATCHLIST (functions/*.py) yet. Purely
-    for tracking; adding a ticker here does not trigger research or trading."""
+    for tracking and automatic research; adding a ticker does not enable trading."""
     __tablename__ = "watched_tickers"
 
     id = Column(Integer, primary_key=True)

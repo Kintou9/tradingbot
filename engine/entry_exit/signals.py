@@ -101,8 +101,8 @@ def evaluate_exit(
 ) -> TradeSignal | None:
     """Exit logic is separate from entry — value re-rating, stop-loss,
     and time-based exits are each distinct triggers (Section 4)."""
-    if current_price <= stop_loss_price:
+    if stop_loss_price is not None and current_price <= stop_loss_price:
         return TradeSignal(ticker, SignalAction.SELL, "stop_loss", confidence=1.0)
-    if current_price >= take_profit_price:
+    if take_profit_price is not None and current_price >= take_profit_price:
         return TradeSignal(ticker, SignalAction.SELL, "take_profit", confidence=1.0)
     return None

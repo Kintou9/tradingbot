@@ -65,3 +65,10 @@ trading-bot/
 - [ ] Run backtesting with walk-forward validation before paper trading
 - [ ] Run in paper trading mode (`ALPACA_PAPER=true` or Robinhood on a small test amount) before going live
 - [ ] Move secrets to Azure Key Vault before any real deployment
+
+## Unattended paper operation
+
+The bot now uses shared server-side entry limits, a durable order journal,
+broker-held protection, and a separate position supervisor. Start with the
+[deployment and paper-validation guide](deploy/README.md). Paper mode remains
+the default; changes to live mode alone cannot authorize live submissions.

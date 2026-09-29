@@ -1,10 +1,8 @@
 """
-Forward paper-trading runner for the experimental swing strategy
-(engine.swing_strategy). Deliberately its own script, invoked manually —
-NOT wired into api/main.py's autonomous-trading loop, NOT reachable from
-the dashboard's manual buy/sell buttons, and NOT the live strategy in
-functions/market_hours_trading.py. This is the safety boundary requested:
-"do not enable the new strategy for live execution."
+Forward paper runner for the experimental swing strategy. It has its own
+dashboard toggle and separate position/trade tables. Actual orders use the
+shared guarded executor and paper mode is enforced server-side. CLI execution
+also requires the swing autonomy toggle and healthy monitoring.
 
 Two modes:
     --dry-run (default): evaluates the watchlist, logs every candidate
@@ -30,7 +28,10 @@ import argparse
 import json
 from datetime import date, datetime, timezone
 
-from broker.alpaca_client import client as alpaca_client, get_account, get_positions, place_market_order
+from broker.alpaca_client import client as alpaca_client, get_account, get_positions, PAPER
+from engine.entry_exit.execution import execute_buy, execute_sell, maintain_protection
+from engine.entry_exit.risk import RiskRejected
+from db.kill_switch import is_bot_enabled
 from db.session import SessionLocal
 from db.models import NewsItem, ResearchNote, SwingCandidateLog, SwingPosition, SwingTrade
 from engine.price_action_engine.market_data import fetch_ohlcv
@@ -88,6 +89,21 @@ def _open_risk_dollars(db, account_equity: float) -> float:
 
 
 def run_swing_paper_cycle(config: SwingStrategyConfig, execute: bool = False) -> dict:
+    if execute and not PAPER:
+        raise RiskRejected("Experimental swing execution is paper-only")
+    if not execute:
+        return _run_swing_paper_cycle(config, execute=False)
+    db = SessionLocal()
+    try:
+        issues = maintain_protection(db)
+        # Research/data retrieval can be slow. Only execution and protection
+        # acquire the account lock; do not starve the protection worker here.
+        return _run_swing_paper_cycle(config, execute=True, protection_issues=issues)
+    finally:
+        db.close()
+
+
+def _run_swing_paper_cycle(config, execute=False, protection_issues=None):
     account = get_account()
     account_equity = float(account.equity)
     cash_available = float(account.cash)
@@ -117,18 +133,15 @@ def run_swing_paper_cycle(config: SwingStrategyConfig, execute: bool = False) ->
                 continue
             summary["exits"].append({"ticker": ticker, "reason": decision.reason.value, "exit_price": decision.exit_price})
             if execute:
-                pos.exit_order_pending = True
-                db.commit()
-                order = place_market_order(ticker, qty=pos.quantity, side="sell")
-                db.add(SwingTrade(ticker=ticker, action="sell", quantity=pos.quantity, price=decision.exit_price,
-                                   reason=decision.reason.value, order_id=str(order.id)))
-                pos.status = "closed"
-                pos.exit_reason = decision.reason.value
-                pos.exit_price = decision.exit_price
-                pos.exit_timestamp = datetime.now(timezone.utc)
-                pos.sessions_held_at_exit = sessions_held
-                pos.realized_pl = (decision.exit_price - pos.entry_price) * pos.quantity
-                db.commit()
+                try:
+                    execute_sell(db, ticker, pos.quantity, decision.reason.value, strategy="swing")
+                except Exception as exc:
+                    db.rollback()
+                    summary["exits"].append({"ticker": ticker, "error": str(exc)})
+
+        if execute and (protection_issues or not is_bot_enabled()):
+            summary["issues"] = protection_issues or ["New entries paused"]
+            return summary
 
         open_risk = _open_risk_dollars(db, account_equity)
 
@@ -191,17 +204,14 @@ def run_swing_paper_cycle(config: SwingStrategyConfig, execute: bool = False) ->
             open_risk += candidate.planned_dollar_risk  # so a later ticker this same cycle sees the updated total
 
             if execute:
-                order = place_market_order(ticker, qty=candidate.shares, side="buy")
-                db.add(SwingTrade(ticker=ticker, action="buy", quantity=candidate.shares, price=candidate.entry_price,
-                                   estimated_cost=candidate.estimated_cost, reason="swing_entry", order_id=str(order.id)))
-                db.add(SwingPosition(
-                    ticker=ticker, quantity=candidate.shares, entry_price=candidate.entry_price,
-                    stop_price=candidate.stop_price, target_price=candidate.target_price,
-                    entry_timestamp=datetime.now(timezone.utc), entry_session_date=date.today(),
-                    strategy_version=config.strategy_version, config_json=json.dumps(config.as_dict()),
-                    status="open",
-                ))
-                db.commit()
+                try:
+                    execute_buy(db, ticker, qty=None, qty_cap=candidate.shares, reason="swing_entry", strategy="swing",
+                        stop_loss_price=candidate.stop_price, take_profit_price=candidate.target_price,
+                        metadata={"entry_session_date": date.today().isoformat(),
+                                  "strategy_version": candidate.strategy_version,
+                                  "config_json": json.dumps(config.as_dict())})
+                except RiskRejected as exc:
+                    summary["rejected"].append({"ticker": ticker, "reason": str(exc)})
 
         return summary
     finally:
