@@ -265,3 +265,48 @@ class SwingAutonomousModeLog(Base):
     variant = Column(String, nullable=True)  # "A" | "B" | "C" | "D" active when this row was written
     reason = Column(String, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
+
+
+class GraphDecisionLog(Base):
+    """Audit trail + evaluation-layer data source for the supervised
+    LangGraph workflow (agent/). One row per graph run (keyed by thread_id),
+    written incrementally as the run progresses and finalized regardless of
+    outcome, so every run is auditable even if it never reaches human
+    approval. Deliberately separate from ExecutionOrder/Trade (execution's
+    own audit trail) and ResearchNote (the engines' own cache) — this table
+    only records this graph run's specific verdict and, later, an offline
+    process can join it against subsequent price history to score
+    calibration. Never read by evaluate_entry/execute_buy — logically
+    separate from live decision logic."""
+    __tablename__ = "graph_decision_log"
+
+    id = Column(Integer, primary_key=True)
+    thread_id = Column(String, unique=True, index=True, nullable=False)
+    ticker = Column(String, index=True, nullable=False)
+
+    dcf_result_json = Column(Text, nullable=True)
+    technical_result_json = Column(Text, nullable=True)
+    sentiment_score = Column(Float, nullable=True)
+    proposed_signal_json = Column(Text, nullable=True)
+
+    llm_analysis_json = Column(Text, nullable=True)
+    validation_result_json = Column(Text, nullable=True)
+    retry_count = Column(Integer, default=0)
+
+    status = Column(String, nullable=False, default="running")
+    # "running" | "pending_approval" | "no_signal" | "engine_error" |
+    # "validation_exhausted" | "rejected" | "executed" | "execution_failed"
+    human_decision = Column(String, nullable=True)
+    human_feedback = Column(Text, nullable=True)
+
+    execution_result_json = Column(Text, nullable=True)
+    execution_error = Column(Text, nullable=True)
+
+    # Reserved for a later, offline calibration script — not populated by
+    # the graph itself. Kept nullable/unused until that script exists.
+    future_price_1d = Column(Float, nullable=True)
+    future_price_7d = Column(Float, nullable=True)
+    future_price_30d = Column(Float, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    resolved_at = Column(DateTime, nullable=True)

@@ -13,3 +13,5 @@ alpaca-py
 robin-stocks
 requests
 pytest
+langgraph
+pydantic

@@ -20,13 +20,14 @@ import datetime as dt
 import json
 import os
 import secrets
+import uuid
 
 from broker.alpaca_client import get_account as get_broker_account, get_positions as get_broker_positions, PAPER, assert_trading_mode
 from db.analytics import compute_trade_summary
 from db.session import SessionLocal, init_db
 from db.models import (
-    AutonomousModeLog, DiscoveryRunLog, KillSwitchLog, Position, Trade, NewsItem, ResearchNote, WatchedTicker,
-    SwingCandidateLog, SwingPosition, SwingTrade,
+    AutonomousModeLog, DiscoveryRunLog, GraphDecisionLog, KillSwitchLog, Position, Trade, NewsItem, ResearchNote,
+    WatchedTicker, SwingCandidateLog, SwingPosition, SwingTrade,
 )
 from db.kill_switch import is_bot_enabled, set_bot_enabled
 from db.watcher_retention import expire_watched, expires_at, run_watcher_cleanup
@@ -46,6 +47,9 @@ from functions.market_hours_trading import MAX_POSITION_PCT, is_market_hours, ru
 from functions.swing_paper_trading import run_swing_paper_cycle
 from functions.weekly_discovery import run_weekly_stock_discovery
 from functions.scheduled_research import run_scheduled_research
+from langgraph.types import Command
+from agent.graph import get_graph
+from agent.state import initial_state
 
 load_dotenv()
 
@@ -387,6 +391,91 @@ def sell_position(ticker: str, body: TradeRequest = TradeRequest()):
             raise HTTPException(status_code=409, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc))
+    finally:
+        db.close()
+
+
+class GraphResumeRequest(BaseModel):
+    decision: str
+    feedback: str | None = None
+
+
+def _graph_response(result: dict, thread_id: str) -> dict:
+    interrupts = result.get("__interrupt__")
+    if interrupts:
+        return {"thread_id": thread_id, "status": "pending_approval", **interrupts[0].value}
+    return {
+        "thread_id": thread_id,
+        "status": result.get("terminal_reason"),
+        "ticker": result.get("ticker"),
+        "proposed_signal": result.get("proposed_signal"),
+        "execution_result": result.get("execution_result"),
+        "execution_error": result.get("execution_error"),
+        "engine_errors": result.get("engine_errors"),
+    }
+
+
+def _decision_log_json(row, *field_names):
+    return {name: (json.loads(getattr(row, f"{name}_json")) if getattr(row, f"{name}_json") else None)
+        for name in field_names}
+
+
+@app.post("/graph/{ticker}/run", dependencies=[Depends(require_token)])
+def run_graph(ticker: str):
+    """Start a supervised (human-approval-gated) trade evaluation. Reuses
+    the same deterministic engines/execution as the autonomous loop, but
+    pauses before any paper trade for explicit approval via /graph/{thread_id}/resume."""
+    ticker = ticker.upper()
+    thread_id = uuid.uuid4().hex
+    config = {"configurable": {"thread_id": thread_id}}
+    result = get_graph().invoke(initial_state(ticker, thread_id), config=config)
+    return _graph_response(result, thread_id)
+
+
+@app.post("/graph/{thread_id}/resume", dependencies=[Depends(require_token)])
+def resume_graph(thread_id: str, body: GraphResumeRequest):
+    if body.decision not in {"approve", "reject"}:
+        raise HTTPException(status_code=422, detail="decision must be 'approve' or 'reject'")
+    graph = get_graph()
+    config = {"configurable": {"thread_id": thread_id}}
+    if not graph.get_state(config).next:
+        raise HTTPException(status_code=409, detail="No pending approval for this thread_id")
+    result = graph.invoke(Command(resume={"decision": body.decision, "feedback": body.feedback}), config=config)
+    return _graph_response(result, thread_id)
+
+
+@app.get("/graph/pending", dependencies=[Depends(require_token)])
+def list_pending_graph_decisions():
+    db = SessionLocal()
+    try:
+        rows = (db.query(GraphDecisionLog).filter_by(status="pending_approval")
+            .order_by(GraphDecisionLog.created_at.desc()).all())
+        return {"pending": [{
+            "thread_id": r.thread_id, "ticker": r.ticker, "status": r.status,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            **_decision_log_json(r, "proposed_signal"),
+        } for r in rows]}
+    finally:
+        db.close()
+
+
+@app.get("/graph/{thread_id}", dependencies=[Depends(require_token)])
+def get_graph_decision(thread_id: str):
+    db = SessionLocal()
+    try:
+        row = db.query(GraphDecisionLog).filter_by(thread_id=thread_id).first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Unknown thread_id")
+        return {
+            "thread_id": row.thread_id, "ticker": row.ticker, "status": row.status,
+            "sentiment_score": row.sentiment_score, "retry_count": row.retry_count,
+            "human_decision": row.human_decision, "human_feedback": row.human_feedback,
+            "execution_error": row.execution_error,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "resolved_at": row.resolved_at.isoformat() if row.resolved_at else None,
+            **_decision_log_json(row, "dcf_result", "technical_result", "proposed_signal",
+                "llm_analysis", "validation_result", "execution_result"),
+        }
     finally:
         db.close()
 
