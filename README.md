@@ -77,22 +77,18 @@ broker-held protection, and a separate position supervisor. Start with the
 [deployment and paper-validation guide](deploy/README.md). Paper mode remains
 the default; changes to live mode alone cannot authorize live submissions.
 
-## Supervised trade workflow (LangGraph)
+## Agent Orchestration (LangGraph)
 
 The 30-second autonomous loop above has no human in it by design — it's the
 proven, fast path. Alongside it, `agent/` is a second, opt-in workflow built
 on [LangGraph](https://github.com/langchain-ai/langgraph) that runs the exact
-same deterministic engines but pauses for explicit human approval before any
-paper trade executes.
-
-The point isn't "an agent framework is used here." It's where AI is
-deliberately *not* trusted: valuation math, technical indicators, and the
-buy/sell gate (`evaluate_entry`) are 100% deterministic Python, reused
-unmodified from the autonomous path. Claude only gets one job in this
-graph — interpret already-computed evidence and flag risks — and a guardrail
-node checks its output against the numbers it was given before a human ever
-sees it. Claude can never override a risk control or invent a trade the
-deterministic gate wouldn't have proposed on its own.
+same deterministic engines, adds an advisory Claude synthesis step with a
+guardrail, and pauses for explicit human approval before any paper trade
+executes. Valuation math, technical indicators, and the buy/sell gate
+(`evaluate_entry`) stay 100% deterministic Python, reused unmodified from the
+autonomous path — Claude only interprets already-computed evidence, and can
+never override a risk control or invent a trade the deterministic gate
+wouldn't have proposed on its own.
 
 ```mermaid
 flowchart TD
@@ -120,6 +116,25 @@ flowchart TD
 **LLM nodes:** `run_valuation`/`run_technical` (only on a cache miss — they
 call the same engines the autonomous loop's research job does) and
 `llm_synthesis` (the one genuinely new LLM call this feature adds).
+
+**Guardrails and retry, as implemented (`agent/nodes.py`):**
+- Schema validation of Claude's synthesis output against `agent/schemas.py`
+- Numeric cross-check: any fair-value/entry-price Claude cites must match the
+  actual DCF/technical results within 1%, or validation fails
+- Stop-loss/target and minimum tradable position size must be present
+- Retry is capped by `LLM_SYNTHESIS_MAX_RETRIES` (default 2); on exhaustion
+  the run terminates with no trade rather than looping
+- `execute_trade` has exactly one outgoing edge regardless of outcome —
+  order submission itself is never retried by this graph
+
+The three research nodes' concurrency is real, not just diagrammed that
+way — confirmed by timing an identical fan-out/fan-in shape with artificial
+delays (three 0.5s nodes completed in ~0.5s total, not ~1.5s). One rough
+edge: `route_after_approval` treats anything other than the exact string
+`"approve"` as a rejection; the API layer (`POST /graph/{thread_id}/resume`)
+validates the decision before the graph ever sees it, but a caller invoking
+the compiled graph directly, bypassing the API, would get a silent
+(fail-safe, but unannounced) rejection on a typo'd value instead of an error.
 
 ### Running it
 
