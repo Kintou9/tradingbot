@@ -276,6 +276,12 @@ def finalize(state):
             row.proposed_signal_json = json.dumps(state["proposed_signal"])
         if row.sentiment_score is None and state.get("sentiment_score") is not None:
             row.sentiment_score = state["sentiment_score"]
+        if row.llm_analysis_json is None and state.get("llm_analysis") is not None:
+            row.llm_analysis_json = json.dumps(state["llm_analysis"])
+        if row.validation_result_json is None and state.get("validation_result") is not None:
+            row.validation_result_json = json.dumps(state["validation_result"])
+        if not row.retry_count:
+            row.retry_count = state["validation_retry_count"]
         row.status = state["terminal_reason"] or "unknown"
         row.human_decision = state.get("human_decision")
         row.human_feedback = state.get("human_feedback")

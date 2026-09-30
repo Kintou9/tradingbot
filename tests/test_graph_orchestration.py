@@ -4,6 +4,8 @@ NOT execute_buy/execute_sell internals, which tests/test_execution_safety.py
 already covers exhaustively. All engine/LLM/broker calls are mocked at the
 function boundary in agent.nodes, same convention as tests/test_watcher_research.py.
 """
+import json
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -146,8 +148,17 @@ def test_retry_exhaustion_terminates_safely(env, monkeypatch):
     assert result["terminal_reason"] == "validation_exhausted"
     assert env["calls"]["execute_buy"] == 0
 
+    # The audit trail must still capture Claude's analysis and the
+    # guardrail's verdict on this path, even though it never reached
+    # record_pending_approval (caught via review: finalize() originally
+    # only backfilled dcf/technical/proposed_signal/sentiment_score).
     row = _log_row(env)
     assert row.status == "validation_exhausted"
+    assert row.retry_count == 2
+    assert row.llm_analysis_json is not None
+    assert json.loads(row.llm_analysis_json)["cited_fair_value"] == -1.0
+    assert row.validation_result_json is not None
+    assert json.loads(row.validation_result_json)["valid"] is False
 
 
 # --- Human approval / rejection ---
