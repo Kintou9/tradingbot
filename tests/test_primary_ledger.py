@@ -7,7 +7,7 @@ import pytest
 
 from backtesting.primary_inputs import prepare_primary_data
 from backtesting.primary_ledger import PrimaryLedger, simulate_primary, assert_invariants, size_entry
-from backtesting.primary_marking import PriceBook
+from backtesting.primary_marking import PriceBook, mark_portfolio
 from backtesting.primary_state import (
     EventTime, Phase, PrimarySimulationConfig, OrderIntent, Side, OrderStatus,
     RejectionReason, ExpirationReason, MarkQuality, Fill,
@@ -277,6 +277,474 @@ def test_partial_or_changed_fill_fails_atomically(monkeypatch):
     monkeypatch.setattr(ledger, 'apply_fill', attempt_partial)
     ledger.open_session()
     assert ledger.state.cash == 1000 and not ledger.state.positions
+
+
+def _tail_pending_ledger():
+    ledger = PrimaryLedger(dataset(2, symbols=('A',)), PrimarySimulationConfig(1000., .5))
+    view = start(ledger)
+    ledger.submit_close([order(ledger, view)])
+    ledger.open_session()
+    view = ledger.close_session()
+    ledger.submit_close([order(ledger, view, side=Side.SELL, order_id='tail-sell')])
+    return ledger
+
+
+def _publication_observation(ledger):
+    state = ledger.state
+    return (state, ledger.outcomes, ledger.events, dict(ledger.submitted))
+
+
+def _pending_fill_ledger(monkeypatch, config=None):
+    ledger = PrimaryLedger(dataset(3, symbols=('A',)), config or PrimarySimulationConfig(1000., .5))
+    view = start(ledger)
+    ledger.submit_close([order(ledger, view)])
+    captured = []
+    with monkeypatch.context() as patch:
+        patch.setattr(ledger, 'apply_fill',
+                      lambda fill: (captured.append(fill), (_ for _ in ()).throw(RuntimeError('capture')))[1])
+        with pytest.raises(RuntimeError, match='capture'):
+            ledger.open_session()
+    assert ledger._stage == 'open' and len(captured) == 1
+    return ledger, captured[0]
+
+
+def test_ledger_owned_journal_is_immutable_ordered_and_isolated():
+    left = _tail_pending_ledger()
+    before = left.outcomes
+    assert isinstance(before, tuple) and [o.order_id for o in before] == ['buy-A']
+    right = PrimaryLedger(dataset(2, symbols=('A',)), PrimarySimulationConfig(1000., .5))
+    assert right.outcomes == () and right.outcomes is not left.outcomes
+    result = left.finish()
+    assert [o.order_id for o in result.outcomes] == ['buy-A', 'tail-sell']
+    assert before == (result.outcomes[0],)
+    assert left.state.outcomes == result.outcomes == left.outcomes
+    with pytest.raises((AttributeError, TypeError)):
+        left.outcomes.append(result.outcomes[-1])
+    assert right.outcomes == ()
+
+
+@pytest.mark.parametrize('failure_point', [
+    'outcome_construction', 'journal_preparation', 'candidate_validation',
+    'snapshot_construction', 'before_publication',
+])
+def test_terminal_publication_failure_is_atomic_and_recoverable(monkeypatch, failure_point):
+    import backtesting.primary_ledger as module
+    ledger = _tail_pending_ledger()
+    before = _publication_observation(ledger)
+    message = 'injected-' + failure_point
+
+    with monkeypatch.context() as patch:
+        if failure_point == 'outcome_construction':
+            patch.setattr(module, 'OrderOutcome', lambda *a, **k: (_ for _ in ()).throw(RuntimeError(message)))
+        elif failure_point == 'journal_preparation':
+            patch.setattr(module._OutcomeJournal, 'appended',
+                          lambda *a, **k: (_ for _ in ()).throw(RuntimeError(message)))
+        elif failure_point == 'candidate_validation':
+            patch.setattr(module, 'validate_transition',
+                          lambda *a, **k: (_ for _ in ()).throw(RuntimeError(message)))
+        elif failure_point == 'snapshot_construction':
+            patch.setattr(module, 'PortfolioSnapshot',
+                          lambda *a, **k: (_ for _ in ()).throw(RuntimeError(message)))
+        else:
+            patch.setattr(ledger, '_before_publication',
+                          lambda *a, **k: (_ for _ in ()).throw(RuntimeError(message)))
+        with pytest.raises(RuntimeError, match=message):
+            ledger.finish()
+
+    assert _publication_observation(ledger) == before
+    result = ledger.finish()
+    assert [o.order_id for o in result.outcomes] == ['buy-A', 'tail-sell']
+    assert result.outcomes[-1].reason == ExpirationReason.END_OF_DATASET
+    assert result.terminal_positions
+
+
+def test_stage1_journal_matches_independent_round_trip_arithmetic():
+    data = dataset(n=4, symbols=('A',), overrides={('A', 2): (120., 120.)})
+    ledger = PrimaryLedger(data, PrimarySimulationConfig(1000., .5, fee_pct=.01, slippage_pct=.01))
+    view = start(ledger)
+    ledger.submit_close([order(ledger, view)])
+    ledger.open_session()
+    view = ledger.close_session()
+    ledger.submit_close([order(ledger, view, side=Side.SELL, order_id='sell-A')])
+    result = finish(ledger)
+    buy, sell = result.fills
+    expected_cash = 1000. + buy.cash_delta + sell.cash_delta
+    assert ledger.state.cash == pytest.approx(expected_cash)
+    assert ledger.state.realized_net_pnl == pytest.approx(sell.cash_delta + buy.cash_delta)
+    assert [o.order_id for o in result.outcomes] == ['buy-A', 'sell-A']
+    assert not result.terminal_positions
+
+
+@pytest.mark.parametrize('failure_point', [
+    'outcome_construction', 'journal_preparation', 'candidate_validation',
+    'snapshot_construction', 'generation_construction', 'before_publication',
+])
+def test_accepted_fill_publication_failure_preserves_generation(monkeypatch, failure_point):
+    import backtesting.primary_ledger as module
+    ledger, fill = _pending_fill_ledger(monkeypatch)
+    generation = ledger._generation
+    before = _publication_observation(ledger)
+    message = 'accepted-' + failure_point
+    with monkeypatch.context() as patch:
+        if failure_point == 'outcome_construction':
+            patch.setattr(module, 'OrderOutcome',
+                          lambda *a, **k: (_ for _ in ()).throw(RuntimeError(message)))
+        elif failure_point == 'journal_preparation':
+            patch.setattr(module._OutcomeJournal, 'appended',
+                          lambda *a, **k: (_ for _ in ()).throw(RuntimeError(message)))
+        elif failure_point == 'candidate_validation':
+            patch.setattr(module, 'validate_transition',
+                          lambda *a, **k: (_ for _ in ()).throw(RuntimeError(message)))
+        elif failure_point == 'snapshot_construction':
+            patch.setattr(module, 'PortfolioSnapshot',
+                          lambda *a, **k: (_ for _ in ()).throw(RuntimeError(message)))
+        elif failure_point == 'generation_construction':
+            patch.setattr(module, '_LedgerGeneration',
+                          lambda *a, **k: (_ for _ in ()).throw(RuntimeError(message)))
+        else:
+            patch.setattr(ledger, '_before_publication',
+                          lambda *a, **k: (_ for _ in ()).throw(RuntimeError(message)))
+        with pytest.raises(RuntimeError, match=message):
+            ledger.apply_fill(fill)
+    assert ledger._generation is generation
+    assert ledger._stage == 'open'
+    assert _publication_observation(ledger) == before
+    ledger.apply_fill(fill)
+    assert ledger.state.cash == 500 and set(ledger.state.positions) == {'A'}
+    assert [o.order_id for o in ledger.outcomes] == ['buy-A']
+
+
+@pytest.mark.parametrize('failure_point', ['event_append', 'snapshot_append', 'decision_append'])
+def test_history_preparation_failure_does_not_publish(monkeypatch, failure_point):
+    import backtesting.primary_ledger as module
+    ledger = PrimaryLedger(dataset(3, symbols=('A',)), PrimarySimulationConfig(1000., .5))
+    ledger.open_session()
+    view = ledger.close_session()
+    generation = ledger._generation
+    before = _publication_observation(ledger)
+    message = 'history-' + failure_point
+    with monkeypatch.context() as patch:
+        if failure_point == 'decision_append':
+            patch.setattr(module._PersistentHistory, 'extended',
+                          lambda *a, **k: (_ for _ in ()).throw(RuntimeError(message)))
+        else:
+            original = module._PersistentHistory.appended
+            wanted = module.LedgerEvent if failure_point == 'event_append' else module.PortfolioSnapshot
+            def injected(self, value):
+                if isinstance(value, wanted):
+                    raise RuntimeError(message)
+                return original(self, value)
+            patch.setattr(module._PersistentHistory, 'appended', injected)
+        with pytest.raises(RuntimeError, match=message):
+            ledger.submit_close([order(ledger, view)])
+    assert ledger._generation is generation
+    assert _publication_observation(ledger) == before
+    assert ledger._stage == 'close' and not ledger._close_submitted
+    ledger.submit_close([order(ledger, view)])
+    assert ledger._close_submitted
+
+
+def test_successful_publication_swaps_one_generation_and_views_remain_stable(monkeypatch):
+    ledger = PrimaryLedger(dataset(3, symbols=('A',)), PrimarySimulationConfig(1000., .5))
+    roots = []
+    prepared = []
+    original_hook = ledger._before_publication
+    def observe(next_generation):
+        roots.append(ledger._generation)
+        prepared.append(next_generation)
+        original_hook(next_generation)
+    monkeypatch.setattr(ledger, '_before_publication', observe)
+    old_events = ledger.events
+    old_history = ledger._history.view()
+    old_decisions = ledger._decisions.view()
+    ledger.open_session()
+    assert len(roots) == 1 and ledger._generation is prepared[0]
+    assert roots[0] is not ledger._generation
+    assert old_events == () and old_history == () and old_decisions == ()
+    event_view = ledger.events
+    snapshot_view = ledger._history.view()
+    ledger.close_session()
+    view = ledger.state.decision_view()
+    ledger.submit_close([order(ledger, view)])
+    assert event_view == (ledger.events[0],)
+    assert snapshot_view == (ledger._history.view()[0],)
+    assert old_decisions == () and len(ledger._decisions.view()) == 1
+
+
+def test_persistent_histories_are_isolated_between_ledgers():
+    left = PrimaryLedger(dataset(2, symbols=('A',)), PrimarySimulationConfig(1000., .5))
+    right = PrimaryLedger(dataset(2, symbols=('A',)), PrimarySimulationConfig(1000., .5))
+    left.open_session()
+    assert len(left.events) == 1 and right.events == ()
+    assert left._history.view() and right._history.view() == ()
+    assert left._decisions.view() == right._decisions.view() == ()
+
+
+def test_publication_does_not_materialize_accumulated_histories(monkeypatch):
+    import backtesting.primary_ledger as module
+    ledger = PrimaryLedger(dataset(3, symbols=('A',)), PrimarySimulationConfig(1000., .5))
+    with monkeypatch.context() as patch:
+        patch.setattr(module._PersistentHistory, 'view',
+                      lambda *a, **k: (_ for _ in ()).throw(AssertionError('hot-path materialization')))
+        ledger.open_session()
+        ledger.close_session()
+        ledger.submit_close(())
+    assert len(ledger.events) == 3
+
+
+def test_normal_publication_uses_incremental_validation_without_full_replay(monkeypatch):
+    import backtesting.primary_ledger as module
+    ledger = PrimaryLedger(dataset(3, symbols=('A',)), PrimarySimulationConfig(1000., .5))
+    calls = []
+    original = module.validate_transition
+
+    def counted(*args, **kwargs):
+        calls.append(args[2])
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, 'validate_transition', counted)
+        patch.setattr(module, 'assert_invariants',
+                      lambda *a, **k: (_ for _ in ()).throw(AssertionError('full replay reached')))
+        view = start(ledger)
+        ledger.submit_close([order(ledger, view)])
+        ledger.open_session()
+        ledger.close_session()
+        ledger.submit_close(())
+        ledger.open_session()
+        ledger.close_session()
+        result = ledger.finish()
+    assert calls == [event.kind for event in ledger.events]
+    assert result.audit_receipt is not None
+
+
+def test_publication_does_not_materialize_outcome_journal(monkeypatch):
+    import backtesting.primary_ledger as module
+    ledger, fill = _pending_fill_ledger(monkeypatch)
+    previous = ledger._journal
+    with monkeypatch.context() as patch:
+        patch.setattr(module._OutcomeJournal, 'view',
+                      lambda *a, **k: (_ for _ in ()).throw(AssertionError('journal scan')))
+        ledger.apply_fill(fill)
+    assert ledger._journal.size == 1
+    assert ledger._journal.head.previous is previous.head
+    assert ledger._state.outcomes == ()
+
+
+def _captured_buy_candidate(monkeypatch, config=None):
+    ledger, fill = _pending_fill_ledger(monkeypatch, config)
+    captured = []
+    with monkeypatch.context() as patch:
+        patch.setattr(ledger, '_publish', lambda *a, **k: (captured.append((a, k)),
+                      (_ for _ in ()).throw(RuntimeError('captured')))[1])
+        with pytest.raises(RuntimeError, match='captured'):
+            ledger.apply_fill(fill)
+    args, kwargs = captured[0]
+    return ledger, args[0], kwargs['outcome']
+
+
+def _captured_sell_candidate(monkeypatch, config):
+    ledger = PrimaryLedger(dataset(4, symbols=('A',), overrides={('A', 2): (120., 120.)}), config)
+    view = start(ledger)
+    ledger.submit_close([order(ledger, view)])
+    ledger.open_session()
+    view = ledger.close_session()
+    ledger.submit_close([order(ledger, view, side=Side.SELL, order_id='sell-A')])
+    fills = []
+    with monkeypatch.context() as patch:
+        patch.setattr(ledger, 'apply_fill',
+                      lambda fill: (fills.append(fill), (_ for _ in ()).throw(RuntimeError('capture-sell')))[1])
+        with pytest.raises(RuntimeError, match='capture-sell'):
+            ledger.open_session()
+    captured = []
+    with monkeypatch.context() as patch:
+        patch.setattr(ledger, '_publish', lambda *a, **k: (captured.append((a, k)),
+                      (_ for _ in ()).throw(RuntimeError('captured')))[1])
+        with pytest.raises(RuntimeError, match='captured'):
+            ledger.apply_fill(fills[0])
+    args, kwargs = captured[0]
+    return ledger, args[0], kwargs['outcome'], fills[0]
+
+
+@pytest.mark.parametrize('side', [Side.BUY, Side.SELL])
+def test_incremental_fill_reference_price_with_nonzero_slippage(monkeypatch, side):
+    import copy
+    import backtesting.primary_ledger as module
+    config = PrimarySimulationConfig(1000., .5, fee_pct=.01, slippage_pct=.02)
+    if side == Side.BUY:
+        ledger, candidate, outcome = _captured_buy_candidate(monkeypatch, config)
+        valid_fill = outcome.fill
+    else:
+        ledger, candidate, outcome, valid_fill = _captured_sell_candidate(monkeypatch, config)
+    opening = ledger._book.price(valid_fill.symbol, valid_fill.at)
+    assert valid_fill.reference_price == opening
+    assert valid_fill.price == pytest.approx(opening * (1.02 if side == Side.BUY else .98))
+
+    generation = ledger._generation
+    corrupted_fill = copy.copy(valid_fill)
+    object.__setattr__(corrupted_fill, 'reference_price', opening + 1)
+    corrupted_outcome = copy.copy(outcome)
+    object.__setattr__(corrupted_outcome, 'fill', corrupted_fill)
+    with monkeypatch.context() as patch:
+        patch.setattr(module, 'assert_invariants',
+                      lambda *a, **k: (_ for _ in ()).throw(AssertionError('full replay reached')))
+        with pytest.raises(ValueError, match='Incremental invariant: fill reference price'):
+            ledger._publish(candidate, 'fill', valid_fill.order_id, outcome=corrupted_outcome)
+    assert ledger._generation is generation
+
+    ledger.apply_fill(valid_fill)
+    assert ledger.outcomes[-1].fill.reference_price == opening
+    assert ledger.outcomes[-1].fill.side == side
+
+
+def test_incremental_fill_identity_and_buy_allocation_are_checked_locally(monkeypatch):
+    import copy
+    import backtesting.primary_ledger as module
+    ledger, candidate, outcome = _captured_buy_candidate(monkeypatch)
+    generation = ledger._generation
+
+    for field, value in [('side', Side.SELL),
+                         ('signal_at', replace(outcome.fill.signal_at, sequence=1))]:
+        corrupted_fill = copy.copy(outcome.fill)
+        object.__setattr__(corrupted_fill, field, value)
+        corrupted = copy.copy(outcome)
+        object.__setattr__(corrupted, 'fill', corrupted_fill)
+        with pytest.raises(ValueError, match='fill identity'):
+            module.validate_transition(generation, candidate, 'fill', generation.submitted,
+                ledger._book, ledger.config, outcome=corrupted)
+
+    with pytest.raises(ValueError, match='buy allocation exceeded'):
+        module.validate_transition(generation, candidate, 'fill', generation.submitted,
+            ledger._book, replace(ledger.config, allocation_pct=.4), outcome=outcome)
+    assert ledger._generation is generation
+
+
+@pytest.mark.parametrize('corruption', ['cash', 'quantity', 'cost_basis', 'realized',
+                                         'missing_outcome', 'wrong_status'])
+def test_incremental_buy_validator_rejects_corruption_before_full_replay(monkeypatch, corruption):
+    import backtesting.primary_ledger as module
+    ledger, candidate, outcome = _captured_buy_candidate(monkeypatch)
+    generation = ledger._generation
+    if corruption == 'cash':
+        candidate.cash += 1
+        candidate.equity += 1
+    elif corruption in ('quantity', 'cost_basis'):
+        position = candidate.positions['A']
+        object.__setattr__(position, corruption, getattr(position, corruption) + 1)
+    elif corruption == 'realized':
+        candidate.realized_net_pnl += 1
+    elif corruption == 'missing_outcome':
+        outcome = None
+    else:
+        object.__setattr__(outcome, 'status', OrderStatus.REJECTED)
+    with monkeypatch.context() as patch:
+        patch.setattr(module, 'assert_invariants',
+                      lambda *a, **k: (_ for _ in ()).throw(AssertionError('full replay reached')))
+        with pytest.raises(ValueError, match='Incremental invariant'):
+            ledger._publish(candidate, 'fill', 'buy-A', outcome=outcome)
+    assert ledger._generation is generation
+
+
+def test_incremental_nonfill_reasons_and_chronology_are_independent(monkeypatch):
+    import backtesting.primary_ledger as module
+    ledger = PrimaryLedger(dataset(3, symbols=('A',)), PrimarySimulationConfig(1000., .5))
+    view = start(ledger)
+    ledger.submit_close([order(ledger, view)])
+    ledger.open_session()
+    view = ledger.close_session()
+    ledger.submit_close([order(ledger, view, side=Side.SELL, order_id='sell')])
+    ledger.open_session()
+    view = ledger.close_session()
+    ledger.submit_close([order(ledger, view, order_id='tail-buy')])
+    current = ledger._generation
+    intent = current.state.pending['A']
+    candidate = module._advance(current.state, replace(current.state.at, sequence=current.state.at.sequence+1))
+    del candidate.pending['A']
+
+    wrong_context = module.OrderOutcome(intent.order_id, OrderStatus.EXPIRED, candidate.at,
+                                        ExpirationReason.MISSING_EXECUTION_BAR)
+    with pytest.raises(ValueError, match='missing-bar'):
+        module.validate_transition(current, candidate, 'expired', current.submitted,
+            ledger._book, ledger.config, outcome=wrong_context)
+    terminal = module.OrderOutcome(intent.order_id, OrderStatus.EXPIRED, candidate.at,
+                                   ExpirationReason.END_OF_DATASET)
+    bad_meta = replace(current.validation, last_outcome_at=replace(candidate.at, sequence=candidate.at.sequence+1))
+    with pytest.raises(ValueError, match='chronology'):
+        module.validate_transition(replace(current, validation=bad_meta), candidate, 'expired',
+            current.submitted, ledger._book, ledger.config, outcome=terminal)
+    object.__setattr__(terminal, 'reason', RejectionReason.INSUFFICIENT_CASH)
+    with pytest.raises(ValueError, match='expiration'):
+        module.validate_transition(current, candidate, 'expired', current.submitted,
+            ledger._book, ledger.config, outcome=terminal)
+    assert ledger._generation is current
+
+
+@pytest.mark.parametrize('field,value', [('outcome_count', 1), ('fill_count', 1),
+                                         ('cumulative_cash_delta', 1.0)])
+def test_incremental_metadata_corruption_is_detected_without_history_replay(monkeypatch, field, value):
+    import backtesting.primary_ledger as module
+    ledger = PrimaryLedger(dataset(2, symbols=('A',)), PrimarySimulationConfig(1000., .5))
+    current = ledger._generation
+    candidate = mark_portfolio(current.state, ledger._book,
+                               EventTime(ledger.data.sessions[0], Phase.OPEN))
+    corrupted = replace(current, validation=replace(current.validation, **{field: value}))
+    with monkeypatch.context() as patch:
+        patch.setattr(module, 'assert_invariants',
+                      lambda *a, **k: (_ for _ in ()).throw(AssertionError('full replay reached')))
+        with pytest.raises(ValueError, match='metadata'):
+            module.validate_transition(corrupted, candidate, 'opening_marks', current.submitted,
+                ledger._book, ledger.config, outcome=None, index=0, stage='open')
+    assert ledger._generation is current
+
+
+def test_incremental_rejection_reason_and_stale_mark_corruption(monkeypatch):
+    import backtesting.primary_ledger as module
+    ledger, _ = _pending_fill_ledger(monkeypatch)
+    current = ledger._generation
+    intent = current.state.pending['A']
+    candidate = module._advance(current.state, replace(current.state.at, sequence=current.state.at.sequence+1))
+    del candidate.pending['A']
+    rejected = module.OrderOutcome(intent.order_id, OrderStatus.REJECTED, candidate.at,
+                                   RejectionReason.INSUFFICIENT_CASH)
+    object.__setattr__(rejected, 'reason', ExpirationReason.END_OF_DATASET)
+    with pytest.raises(ValueError, match='rejection'):
+        module.validate_transition(current, candidate, 'rejected', current.submitted,
+            ledger._book, ledger.config, outcome=rejected)
+
+    data = dataset(4, symbols=('A',), missing={'A': [2]})
+    marked = PrimaryLedger(data, PrimarySimulationConfig(1000., .5))
+    view = start(marked)
+    marked.submit_close([order(marked, view)])
+    marked.open_session()
+    marked.close_session()
+    prior = marked._generation
+    at = EventTime(data.sessions[2], Phase.OPEN)
+    stale = mark_portfolio(prior.state, marked._book, at)
+    position = stale.positions['A']
+    stale.positions['A'] = replace(position, mark=replace(position.mark, value=position.mark.value+1))
+    with pytest.raises(ValueError, match='stale mark'):
+        module.validate_transition(prior, stale, 'opening_marks', prior.submitted,
+            marked._book, marked.config, outcome=None, index=2, stage='open')
+    assert marked._generation is prior
+
+
+def test_incremental_validator_does_not_visit_historical_outcomes():
+    import backtesting.primary_ledger as module
+    ledger = PrimaryLedger(dataset(2, symbols=('A',)), PrimarySimulationConfig(1000., .5))
+    ledger.open_session()
+    current = ledger._generation
+    at = EventTime(ledger.data.sessions[0], Phase.CLOSE)
+    candidate = mark_portfolio(current.state, ledger._book, at)
+    class PoisonHistory:
+        def __iter__(self):
+            raise AssertionError('historical outcome visited')
+        def __len__(self):
+            raise AssertionError('historical outcome counted')
+    poisoned_state = replace(current.state, outcomes=PoisonHistory())
+    metadata = module.validate_transition(replace(current, state=poisoned_state), candidate,
+        'closing_marks', current.submitted, ledger._book, ledger.config,
+        outcome=None, stage='close', close_submitted=False)
+    assert metadata is current.validation
 
 
 def test_journal_invariants_detect_balanced_but_fake_ledger():

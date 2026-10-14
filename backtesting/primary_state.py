@@ -553,6 +553,39 @@ class ClosedTrade:
 
 
 @dataclass(frozen=True)
+class JournalAuditReceipt:
+    """Content identity for reconciled evidence, not proof of trusted origin."""
+    schema_version: str
+    algorithm: str
+    evidence_digest: str
+    input_digest: str
+    config_digest: str
+    journal_digest: str
+    snapshot_digest: str
+    terminal_state_digest: str
+    submitted_count: int
+    outcome_count: int
+    fill_count: int
+    event_count: int
+    snapshot_count: int
+    terminal_reason: ExpirationReason
+
+    def __post_init__(self):
+        if self.schema_version != "primary_journal_audit_v1" or self.algorithm != "sha256":
+            raise ValueError("Unsupported journal audit receipt version or algorithm")
+        for name in ("evidence_digest", "input_digest", "config_digest", "journal_digest",
+                     "snapshot_digest", "terminal_state_digest"):
+            if not re.fullmatch(r"[0-9a-f]{64}", getattr(self, name)):
+                raise ValueError(f"{name} must be SHA-256")
+        for name in ("submitted_count", "outcome_count", "fill_count", "event_count", "snapshot_count"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError("Audit receipt counts must be nonnegative integers")
+        if self.fill_count > self.outcome_count or not isinstance(self.terminal_reason, ExpirationReason):
+            raise ValueError("Invalid audit receipt counts or terminal reason")
+
+
+@dataclass(frozen=True)
 class SimulationResult:
     """Future engine output container; no matching or reporting implementation."""
     config: PrimarySimulationConfig
@@ -564,6 +597,7 @@ class SimulationResult:
     history: tuple[PortfolioSnapshot, ...] = ()
     closed_trades: tuple[ClosedTrade, ...] = ()
     manifest_json: str = "{}"
+    audit_receipt: JournalAuditReceipt | None = None
 
     def __post_init__(self):
         if not re.fullmatch(r"[0-9a-f]{64}", self.dataset_hash):
@@ -581,3 +615,5 @@ class SimulationResult:
             raise ValueError("Result history must be strictly chronological")
         if not isinstance(json.loads(self.manifest_json), dict):
             raise ValueError("Result manifest must be a JSON object")
+        if self.audit_receipt is not None and not isinstance(self.audit_receipt, JournalAuditReceipt):
+            raise ValueError("Invalid journal audit receipt")
